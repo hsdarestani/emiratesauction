@@ -10,6 +10,28 @@ from .config import settings
 
 HEADERS = {"Lang": "en", "Source": "web", "User-Agent": "EmiratesAuctionIntelligence/1.0"}
 
+PREMIUM_MAKES = (
+    "Mercedes", "BMW", "Audi", "Porsche", "Lexus", "Range Rover", "Land Rover",
+    "Bentley", "Rolls Royce", "Rolls-Royce", "Cadillac", "Infiniti", "Jaguar",
+    "Maserati", "Lamborghini", "Ferrari", "McLaren", "Aston Martin", "Tesla",
+    "Lincoln", "Hummer", "Genesis",
+)
+VALUABLE_MODELS = (
+    "Toyota Land Cruiser", "Toyota Prado", "Toyota Supra", "Toyota FJ Cruiser",
+    "Nissan Patrol", "Nissan GT-R", "Nissan GTR", "Nissan 370Z", "Nissan 350Z",
+    "Ford Mustang", "Ford Raptor", "Ford Bronco", "Ford Expedition",
+    "Chevrolet Corvette", "Chevrolet Camaro", "Chevrolet Tahoe", "Chevrolet Suburban",
+    "Dodge Challenger", "Dodge Charger", "Dodge Viper", "Jeep Wrangler", "Jeep Grand Cherokee",
+    "GMC Yukon", "GMC Sierra", "Volkswagen Golf R", "Volkswagen Touareg", "Volvo XC90",
+)
+
+
+def is_quality_vehicle(item):
+    title = (item.get("Title") or item.get("EventTitle") or "").strip().lower()
+    if any(term in title for term in ("mb316", "sprinter", "actros", "atego", "motorbike", "motorcycle", "jet ski", "truck", "trailer", "forklift", "fork lift")):
+        return False
+    return any(make.lower() in title for make in PREMIUM_MAKES) or any(model.lower() in title for model in VALUABLE_MODELS)
+
 
 def money(value):
     if value is None:
@@ -61,10 +83,16 @@ def normalize(listing, detail=None):
     odometer = specs.get("odometer") or detail.get("OdometerStr") or ""
     mileage_match = re.search(r"[\d,]+", odometer)
     lot = str(detail.get("Lot") or listing.get("Lot") or listing.get("Id"))
+    title = detail.get("Title") or listing.get("Title") or ""
+    title_without_year = re.sub(r"^\s*\d{4}\s+", "", title).strip()
+    detected_make = next((m for m in PREMIUM_MAKES if title_without_year.lower().startswith(m.lower())), None)
+    if not detected_make:
+        detected_make = next((m.split()[0] for m in VALUABLE_MODELS if title_without_year.lower().startswith(m.split()[0].lower())), None)
+    detected_model = title_without_year[len(detected_make):].strip() if detected_make and title_without_year.lower().startswith(detected_make.lower()) else None
     return {
         "lot_id": lot, "auction_id": str(detail.get("AuctionTypeId") or 4),
-        "url": f"{settings.ea_site_url}/auctions/vehicles/{lot}/4", "title": detail.get("Title") or listing.get("Title"),
-        "vin": specs.get("vin number") or None, "make": specs.get("make"), "model": specs.get("model"),
+        "url": f"{settings.ea_site_url}/auctions/vehicles/{lot}/4", "title": title,
+        "vin": specs.get("vin number") or None, "make": specs.get("make") or detected_make, "model": specs.get("model") or detected_model,
         "trim": specs.get("trim"), "year": detail.get("Year") or listing.get("Year"),
         "mileage": int(mileage_match.group().replace(",", "")) if mileage_match else None,
         "fuel": specs.get("fuel type"), "transmission": specs.get("transmission"), "color": specs.get("exterior"),

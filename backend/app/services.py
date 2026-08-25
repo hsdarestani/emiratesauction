@@ -2,7 +2,7 @@ from decimal import Decimal
 from sqlalchemy import desc, select
 
 from .models import AuctionResult, AuctionSnapshot, MarketPrice, Vehicle, VehicleImage
-from .scraper import fetch_detail, fetch_live, normalize
+from .scraper import fetch_detail, fetch_live, is_quality_vehicle, normalize
 
 
 def upsert_vehicle(db, payload, tracked=False):
@@ -32,22 +32,31 @@ def upsert_vehicle(db, payload, tracked=False):
 
 def collect(db, limit=10):
     active_inventory = fetch_live()
-    listings = active_inventory[:limit]
+    listings = [item for item in active_inventory if is_quality_vehicle(item)]
     collected = []
+    # Store and snapshot every qualifying vehicle from the full inventory using
+    # the lightweight list payload. This makes the dashboard complete without
+    # issuing hundreds of detail-page requests every five minutes.
     for listing in listings:
-        try: detail = fetch_detail(listing.get("Lot") or listing["Id"])
-        except Exception: detail = None
-        collected.append(upsert_vehicle(db, normalize(listing, detail), tracked=True))
+        collected.append(upsert_vehicle(db, normalize(listing), tracked=True))
+    # Enrich a bounded rotating batch with specifications, documents and media.
+    needs_detail = db.scalars(select(Vehicle).where(Vehicle.status == "active", Vehicle.is_tracked.is_(True), Vehicle.body_type.is_(None)).order_by(Vehicle.auction_end_time.asc())).all()
+    for vehicle in needs_detail[:limit]:
+        listing = next((x for x in listings if str(x.get("Lot") or x.get("Id")) == vehicle.lot_id), None)
+        if not listing: continue
+        try: detail = fetch_detail(vehicle.lot_id)
+        except Exception: continue
+        upsert_vehicle(db, normalize(listing, detail), tracked=True)
     tracked = db.scalars(select(Vehicle).where(Vehicle.is_tracked.is_(True), Vehicle.status == "active")).all()
-    known = {str(x.get("Lot") or x.get("Id")): x for x in active_inventory}
+    known = {str(x.get("Lot") or x.get("Id")): x for x in listings}
     for vehicle in tracked:
         listing = known.get(vehicle.lot_id)
         if listing:
-            if vehicle.lot_id not in {v.lot_id for v in collected}:
-                try: detail = fetch_detail(vehicle.lot_id)
-                except Exception: detail = None
-                upsert_vehicle(db, normalize(listing, detail), tracked=True)
             continue
+        # Existing low-quality/non-car records from the first deployment should
+        # disappear without being counted as historical vehicle results.
+        if not is_quality_vehicle({"Title": vehicle.title}):
+            vehicle.status = "ignored"; vehicle.is_tracked = False; db.commit(); continue
         vehicle.status = "closed"
         result = db.scalar(select(AuctionResult).where(AuctionResult.vehicle_id == vehicle.id))
         if not result:
