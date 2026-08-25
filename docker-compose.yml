@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auction
+      POSTGRES_USER: auction
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-auction-change-me}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck: {test: [CMD-SHELL, pg_isready -U auction], interval: 5s, timeout: 5s, retries: 10}
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://auction:${POSTGRES_PASSWORD:-auction-change-me}@postgres:5432/auction
+      REDIS_URL: redis://redis:6379/0
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-change-me}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    depends_on: {postgres: {condition: service_healthy}}
+  worker:
+    build: ./backend
+    command: celery -A app.worker.celery worker -B --loglevel=info
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg2://auction:${POSTGRES_PASSWORD:-auction-change-me}@postgres:5432/auction
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [backend, redis]
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports: ["127.0.0.1:8087:80"]
+    depends_on: [backend]
+volumes: {postgres_data: {}}
+
