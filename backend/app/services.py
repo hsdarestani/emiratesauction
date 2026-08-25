@@ -31,18 +31,28 @@ def upsert_vehicle(db, payload, tracked=False):
 
 
 def collect(db, limit=10):
-    listings = fetch_live(limit)
+    active_inventory = fetch_live()
+    listings = active_inventory[:limit]
     collected = []
     for listing in listings:
         try: detail = fetch_detail(listing.get("Lot") or listing["Id"])
         except Exception: detail = None
         collected.append(upsert_vehicle(db, normalize(listing, detail), tracked=True))
     tracked = db.scalars(select(Vehicle).where(Vehicle.is_tracked.is_(True), Vehicle.status == "active")).all()
-    known = {str(x.get("Lot") or x.get("Id")): x for x in listings}
+    known = {str(x.get("Lot") or x.get("Id")): x for x in active_inventory}
     for vehicle in tracked:
-        if vehicle.lot_id in known: continue
-        try: upsert_vehicle(db, normalize({}, fetch_detail(vehicle.lot_id)), tracked=True)
-        except Exception: pass
+        listing = known.get(vehicle.lot_id)
+        if listing:
+            if vehicle.lot_id not in {v.lot_id for v in collected}:
+                try: detail = fetch_detail(vehicle.lot_id)
+                except Exception: detail = None
+                upsert_vehicle(db, normalize(listing, detail), tracked=True)
+            continue
+        vehicle.status = "closed"
+        result = db.scalar(select(AuctionResult).where(AuctionResult.vehicle_id == vehicle.id))
+        if not result:
+            db.add(AuctionResult(vehicle_id=vehicle.id, final_bid=Decimal(vehicle.current_bid or 0)))
+        db.commit()
     return collected
 
 
@@ -53,4 +63,3 @@ def opportunity(vehicle):
     discount = (profit / market * 100) if market else Decimal(0)
     risk = min(100, 18 * len(vehicle.condition_tags or []))
     return {"market_price": float(market), "potential_profit": float(profit), "discount_percent": round(float(discount), 1), "risk_score": risk}
-

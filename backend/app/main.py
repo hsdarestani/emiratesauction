@@ -35,7 +35,9 @@ def startup(): Base.metadata.create_all(engine)
 
 def serialize(v):
     data = {c.name: getattr(v, c.name) for c in v.__table__.columns}
-    data.update(opportunity(v)); data["images"] = [x.url for x in v.images[:8]]
+    data.update(opportunity(v)); data["images"] = [x.url for x in v.images[:20]]
+    data["final_bid"] = float(v.result.final_bid) if v.result else (float(v.current_bid or 0) if v.status == "closed" else None)
+    data["sold_date"] = v.result.sold_date if v.result else None
     return data
 
 
@@ -63,7 +65,13 @@ def history(vehicle_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/auctions/live")
 def live(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(Vehicle.status == "active").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices)).order_by(Vehicle.auction_end_time)).all()
+    rows = db.scalars(select(Vehicle).where(Vehicle.status == "active").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result)).order_by(Vehicle.auction_end_time)).all()
+    return [serialize(x) for x in rows]
+
+
+@app.get("/api/auctions/closed")
+def closed(db: Session = Depends(get_db)):
+    rows = db.scalars(select(Vehicle).where(Vehicle.status == "closed").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
     return [serialize(x) for x in rows]
 
 
@@ -100,4 +108,3 @@ def valuation(vehicle_id: int, body: ValuationIn, x_admin_token: Annotated[str |
 def collect_now(x_admin_token: Annotated[str | None, Header()] = None, db: Session = Depends(get_db)):
     if x_admin_token != settings.admin_token: raise HTTPException(401, "Invalid admin token")
     return {"lots": [v.lot_id for v in collect(db, settings.poll_limit)]}
-

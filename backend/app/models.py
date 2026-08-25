@@ -50,6 +50,7 @@ class Vehicle(Base):
     snapshots = relationship("AuctionSnapshot", cascade="all, delete-orphan")
     images = relationship("VehicleImage", cascade="all, delete-orphan")
     market_prices = relationship("MarketPrice", cascade="all, delete-orphan")
+    result = relationship("AuctionResult", cascade="all, delete-orphan", uselist=False)
 
 
 class AuctionSnapshot(Base):
@@ -86,4 +87,3 @@ class MarketPrice(Base):
     source: Mapped[str] = mapped_column(String(80), default="manual")
     market_price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
-

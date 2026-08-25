@@ -21,14 +21,14 @@ def parse_dt(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
 
 
-def fetch_live(limit=10):
+def fetch_live(limit=None):
     with httpx.Client(timeout=30, headers=HEADERS, follow_redirects=True) as client:
         response = client.post(f"{settings.ea_api_url}/api/Vehicles", json={})
         response.raise_for_status()
         data = response.json().get("Data", [])
     active = [x for x in data if not x.get("IsExpired")]
     active.sort(key=lambda x: x.get("EndDate") or "9999")
-    return active[:limit]
+    return active[:limit] if limit else active
 
 
 def fetch_detail(lot_id):
