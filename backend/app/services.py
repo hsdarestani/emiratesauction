@@ -2,6 +2,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from sqlalchemy import desc, select
 
+from .config import settings
+from .damage_analysis import analyze_purchase
 from .models import AuctionResult, AuctionSnapshot, MarketPrice, Vehicle, VehicleImage
 from .scraper import fetch_detail, fetch_live, is_quality_vehicle, normalize
 
@@ -127,7 +129,7 @@ def verify_final_price(db, vehicle, detail=None):
     vehicle.current_bid = price
     vehicle.status = "verified"
     vehicle.finished_at = vehicle.finished_at or verified_at
-    result.final_bid = price  # compatibility for existing consumers
+    result.final_bid = price
     result.verified_final_price = price
     result.final_price_verified_at = verified_at
     result.final_price_source = f"{vehicle.url} (__NEXT_DATA__.detailsData.Data; IsExpired=true)"
@@ -140,12 +142,8 @@ def collect(db, limit=10):
     active_inventory = fetch_live()
     listings = [item for item in active_inventory if is_quality_vehicle(item)]
     collected = []
-    # Store and snapshot every qualifying vehicle from the full inventory using
-    # the lightweight list payload. This makes the dashboard complete without
-    # issuing hundreds of detail-page requests every five minutes.
     for listing in listings:
         collected.append(upsert_vehicle(db, normalize(listing), tracked=True))
-    # Enrich a bounded rotating batch with specifications, documents and media.
     needs_detail = db.scalars(select(Vehicle).where(Vehicle.status == "active", Vehicle.is_tracked.is_(True), Vehicle.body_type.is_(None)).order_by(Vehicle.auction_end_time.asc())).all()
     for vehicle in needs_detail[:limit]:
         listing = next((x for x in listings if str(x.get("Lot") or x.get("Id")) == vehicle.lot_id), None)
@@ -159,22 +157,45 @@ def collect(db, limit=10):
         listing = known.get(vehicle.lot_id)
         if listing:
             continue
-        # Existing low-quality/non-car records from the first deployment should
-        # disappear without being counted as historical vehicle results.
         if not is_quality_vehicle({"Title": vehicle.title}):
             vehicle.status = "ignored"; vehicle.is_tracked = False; db.commit(); continue
         try:
             update_one(db, vehicle)
         except Exception:
-            # A transient list/detail outage must never fabricate an auction end.
             continue
     return collected
 
 
 def opportunity(vehicle):
-    prices = [Decimal(x.market_price) for x in vehicle.market_prices]
-    market = sum(prices) / len(prices) if prices else Decimal(0)
-    profit = market - Decimal(vehicle.current_bid or 0) - Decimal(vehicle.repair_estimate or 0) - Decimal(vehicle.import_cost or 0)
-    discount = (profit / market * 100) if market else Decimal(0)
-    risk = min(100, 18 * len(vehicle.condition_tags or []))
-    return {"market_price": float(market), "potential_profit": float(profit), "discount_percent": round(float(discount), 1), "risk_score": risk}
+    manual_prices = [Decimal(x.market_price) for x in vehicle.market_prices]
+    market = sum(manual_prices) / len(manual_prices) if manual_prices else Decimal(0)
+    market_source = "Manuelle Bewertung" if market > 0 else None
+    german = vehicle.german_market
+    if german and german.status == "ready" and german.median_price_eur:
+        market = Decimal(german.median_price_eur) * Decimal(german.eur_aed_rate or settings.eur_aed_rate)
+        market_source = "AutoScout24 Deutschland"
+
+    if vehicle.status == "finished" and vehicle.price_data_valid and vehicle.result and vehicle.result.final_bid is not None:
+        purchase_price = Decimal(vehicle.result.final_bid)
+    else:
+        purchase_price = Decimal(vehicle.current_bid or 0)
+
+    analysis = analyze_purchase(
+        condition=vehicle.condition,
+        tags=vehicle.condition_tags,
+        damage_description=vehicle.damage_description,
+        make=vehicle.make,
+        purchase_price_aed=purchase_price,
+        market_value_aed=market,
+        import_cost_aed=vehicle.import_cost,
+        manual_repair_aed=vehicle.repair_estimate,
+        eur_aed_rate=settings.eur_aed_rate,
+    )
+    analysis.update({
+        "market_price": float(market),
+        "market_reference_source": market_source,
+        "potential_profit": analysis["estimated_net_profit_aed"],
+        "discount_percent": analysis["estimated_margin_percent"],
+        "risk_score": analysis["damage_risk_score"],
+    })
+    return analysis
