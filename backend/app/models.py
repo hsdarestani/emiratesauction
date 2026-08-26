@@ -50,6 +50,7 @@ class Vehicle(Base):
     snapshots = relationship("AuctionSnapshot", cascade="all, delete-orphan")
     images = relationship("VehicleImage", cascade="all, delete-orphan")
     market_prices = relationship("MarketPrice", cascade="all, delete-orphan")
+    german_market = relationship("GermanMarketComparison", cascade="all, delete-orphan", uselist=False)
     result = relationship("AuctionResult", cascade="all, delete-orphan", uselist=False)
 
 
@@ -87,3 +88,20 @@ class MarketPrice(Base):
     source: Mapped[str] = mapped_column(String(80), default="manual")
     market_price: Mapped[Decimal] = mapped_column(Numeric(14, 2))
     date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class GermanMarketComparison(Base):
+    __tablename__ = "german_market_comparisons"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    vehicle_id: Mapped[int] = mapped_column(ForeignKey("vehicles.id"), unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(80), default="AutoScout24 Germany")
+    search_url: Mapped[str] = mapped_column(Text)
+    median_price_eur: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    min_price_eur: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    max_price_eur: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    comparable_count: Mapped[int] = mapped_column(Integer, default=0)
+    eur_aed_rate: Mapped[Decimal] = mapped_column(Numeric(10, 4))
+    samples: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(30), default="ready")
+    error: Mapped[str | None] = mapped_column(Text)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, selectinload
 from .config import settings
 from .database import Base, engine, get_db
 from .models import AuctionSnapshot, MarketPrice, Vehicle
+from .autoscout import compare_vehicle, serialize_comparison
 from .services import collect, opportunity
 
 app = FastAPI(title="Emirates Auction Intelligence", docs_url="/api/docs", openapi_url="/api/openapi.json")
@@ -38,6 +39,7 @@ def serialize(v):
     data.update(opportunity(v)); data["images"] = [x.url for x in v.images[:20]]
     data["final_bid"] = float(v.result.final_bid) if v.result else (float(v.current_bid or 0) if v.status == "closed" else None)
     data["sold_date"] = v.result.sold_date if v.result else None
+    data["germany"] = serialize_comparison(v) if v.status == "closed" else None
     return data
 
 
@@ -47,13 +49,13 @@ def health(): return {"status": "ok", "source": "Emirates Auction live API"}
 
 @app.get("/api/vehicles")
 def vehicles(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices)).order_by(Vehicle.auction_end_time)).all()
+    rows = db.scalars(select(Vehicle).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(Vehicle.auction_end_time)).all()
     return [serialize(x) for x in rows]
 
 
 @app.get("/api/vehicles/{vehicle_id}")
 def vehicle(vehicle_id: int, db: Session = Depends(get_db)):
-    row = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices)))
+    row = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)))
     if not row: raise HTTPException(404, "Vehicle not found")
     return serialize(row)
 
@@ -65,19 +67,19 @@ def history(vehicle_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/auctions/live")
 def live(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(Vehicle.status == "active").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result)).order_by(Vehicle.auction_end_time)).all()
+    rows = db.scalars(select(Vehicle).where(Vehicle.status == "active").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(Vehicle.auction_end_time)).all()
     return [serialize(x) for x in rows]
 
 
 @app.get("/api/auctions/closed")
 def closed(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(Vehicle.status == "closed").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
+    rows = db.scalars(select(Vehicle).where(Vehicle.status == "closed").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
     return [serialize(x) for x in rows]
 
 
 @app.get("/api/opportunities")
 def opportunities(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices))).all()
+    rows = db.scalars(select(Vehicle).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market))).all()
     return sorted([serialize(x) for x in rows], key=lambda x: x["potential_profit"], reverse=True)
 
 
@@ -108,3 +110,13 @@ def valuation(vehicle_id: int, body: ValuationIn, x_admin_token: Annotated[str |
 def collect_now(x_admin_token: Annotated[str | None, Header()] = None, db: Session = Depends(get_db)):
     if x_admin_token != settings.admin_token: raise HTTPException(401, "Invalid admin token")
     return {"lots": [v.lot_id for v in collect(db, settings.poll_limit)]}
+
+
+@app.post("/api/admin/compare-autoscout/{vehicle_id}")
+def compare_autoscout(vehicle_id: int, x_admin_token: Annotated[str | None, Header()] = None, db: Session = Depends(get_db)):
+    if x_admin_token != settings.admin_token: raise HTTPException(401, "Invalid admin token")
+    row = db.get(Vehicle, vehicle_id)
+    if not row: raise HTTPException(404, "Vehicle not found")
+    if row.status != "closed": raise HTTPException(409, "Comparison is available after the auction finishes")
+    comparison = compare_vehicle(db, row)
+    return {"status": comparison.status, "comparable_count": comparison.comparable_count}

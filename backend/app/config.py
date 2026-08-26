@@ -11,8 +11,10 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     admin_token: str = "change-me"
+    eur_aed_rate: float = 4.30
+    autoscout_refresh_hours: int = 24
+    autoscout_batch_size: int = 8
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()
-
