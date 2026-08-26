@@ -83,9 +83,12 @@ def verify_final_price_task(vehicle_id, attempt=0):
             if not vehicle or vehicle.status == "verified":
                 return "already_verified"
             try:
-                if verify_final_price(db, vehicle):
+                outcome = verify_final_price(db, vehicle)
+                if outcome is True:
                     compare_finished_vehicle.delay(vehicle_id)
                     return "verified"
+                if outcome is None:
+                    return "live"
             except Exception:
                 # The retry schedule below also covers timeouts and temporary
                 # Emirates Auction errors; the unverified value stays hidden.

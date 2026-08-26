@@ -45,7 +45,7 @@ def serialize(v):
     data["final_price_status"] = v.result.final_price_status if v.result else ("live" if v.status in ("active", "ending") else "finalizing")
     data["final_price_verified_at"] = v.result.final_price_verified_at if v.result else None
     data["final_price_source"] = v.result.final_price_source if v.result else None
-    data["sold_date"] = v.result.sold_date if v.result else None
+    data["sold_date"] = v.result.sold_date if v.result and v.status == "verified" else None
     data["germany"] = serialize_comparison(v) if v.status == "verified" else None
     return data
 

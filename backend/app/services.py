@@ -79,8 +79,16 @@ def verify_final_price(db, vehicle, detail=None):
     detail = detail or fetch_detail(vehicle.lot_id)
     payload = normalize({}, detail)
     if payload["status"] != "closed":
+        payload["status"] = "ending" if poll_interval(payload["auction_end_time"]) <= 5 else "active"
+        updated = upsert_vehicle(db, payload, tracked=True)
+        updated.next_poll_at = datetime.now(timezone.utc) + timedelta(seconds=poll_interval(updated.auction_end_time))
+        result.final_bid = None
+        result.verified_final_price = None
+        result.final_price_verified_at = None
+        result.final_price_source = None
+        result.final_price_status = "live"
         db.commit()
-        return False
+        return None
     price = Decimal(payload["current_bid"])
     verified_at = datetime.now(timezone.utc)
     vehicle.current_bid = price
