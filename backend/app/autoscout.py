@@ -56,13 +56,10 @@ def fetch_comparables(vehicle):
             price, year = int(attrs["price"]), int(attrs.get("first-registration", "-").split("-")[-1])
         except (KeyError, ValueError):
             continue
-        # AutoScout sometimes mixes neighbouring years into result pages.
         if abs(year - int(vehicle.year)) > 1 or not 1000 <= price <= 1000000:
             continue
         mileage = int(attrs.get("mileage", 0) or 0)
         candidates.append({"price_eur": price, "mileage_km": mileage or None, "model": html.unescape(attrs.get("model", "")), "year": year})
-    # When the UAE title includes a variant number (GLA 250, E 63, 740, etc.),
-    # only mix variants if AutoScout has fewer than three exact examples.
     variant_numbers = re.findall(r"\b\d{2,3}\b", vehicle.model or "")
     exact = [x for x in candidates if all(re.search(rf"\b{re.escape(number)}\b", x["model"], re.I) for number in variant_numbers)]
     samples = exact if variant_numbers and len(exact) >= 3 else candidates
@@ -107,14 +104,33 @@ def compare_closed(db, limit=None):
     return [compare_vehicle(db, vehicle) for vehicle in rows[:limit or settings.autoscout_batch_size]]
 
 
+def compare_live(db, limit=None):
+    """Build a German reference before an auction ends so buy decisions are useful live."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.autoscout_live_refresh_hours)
+    rows = db.scalars(
+        select(Vehicle).outerjoin(GermanMarketComparison).where(
+            Vehicle.status.in_(("active", "ending")),
+            Vehicle.is_tracked.is_(True),
+            Vehicle.make.is_not(None), Vehicle.model.is_not(None), Vehicle.year.is_not(None),
+            or_(GermanMarketComparison.id.is_(None), GermanMarketComparison.fetched_at < cutoff),
+        ).order_by(Vehicle.auction_end_time.asc())
+    ).all()
+    return [compare_vehicle(db, vehicle) for vehicle in rows[:limit or settings.autoscout_live_batch_size]]
+
+
 def serialize_comparison(vehicle):
     row = vehicle.german_market
     if not row:
         return {"status": "pending"}
     result = vehicle.result
-    final_bid = Decimal(result.verified_final_price if result and result.verified_final_price is not None else 0)
+    if vehicle.status == "finished" and vehicle.price_data_valid and result and result.final_bid is not None:
+        purchase_bid = Decimal(result.final_bid)
+        bid_basis = "Endpreis"
+    else:
+        purchase_bid = Decimal(vehicle.current_bid or 0)
+        bid_basis = "Aktuelles Gebot"
     market_aed = Decimal(row.median_price_eur or 0) * Decimal(row.eur_aed_rate or 0)
-    gross = market_aed - final_bid
+    gross = market_aed - purchase_bid
     net = gross - Decimal(vehicle.repair_estimate or 0) - Decimal(vehicle.import_cost or 0)
     return {
         "source": row.source, "status": row.status, "search_url": row.search_url,
@@ -123,5 +139,5 @@ def serialize_comparison(vehicle):
         "comparable_count": row.comparable_count, "eur_aed_rate": float(row.eur_aed_rate),
         "market_value_aed": float(market_aed), "gross_spread_aed": float(gross),
         "estimated_net_profit_aed": float(net), "fetched_at": row.fetched_at,
-        "error": row.error,
+        "bid_basis": bid_basis, "error": row.error,
     }
