@@ -46,8 +46,17 @@ def serialize(v):
     data["final_price_verified_at"] = v.result.final_price_verified_at if v.result else None
     data["final_price_source"] = v.result.final_price_source if v.result else None
     data["sold_date"] = v.finished_at if v.price_data_valid else None
-    data["germany"] = serialize_comparison(v) if v.status == "finished" and v.price_data_valid else None
+    data["germany"] = serialize_comparison(v)
     return data
+
+
+def vehicle_query():
+    return select(Vehicle).options(
+        selectinload(Vehicle.images),
+        selectinload(Vehicle.market_prices),
+        selectinload(Vehicle.result),
+        selectinload(Vehicle.german_market),
+    )
 
 
 @app.get("/api/health")
@@ -56,13 +65,13 @@ def health(): return {"status": "ok", "source": "Emirates Auction live API"}
 
 @app.get("/api/vehicles")
 def vehicles(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(or_(Vehicle.status.in_(("active", "ending")), Vehicle.price_data_valid.is_(True))).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(Vehicle.auction_end_time)).all()
+    rows = db.scalars(vehicle_query().where(or_(Vehicle.status.in_(("active", "ending")), Vehicle.price_data_valid.is_(True))).order_by(Vehicle.auction_end_time)).all()
     return [serialize(x) for x in rows]
 
 
 @app.get("/api/vehicles/{vehicle_id}")
 def vehicle(vehicle_id: int, db: Session = Depends(get_db)):
-    row = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)))
+    row = db.scalar(vehicle_query().where(Vehicle.id == vehicle_id))
     if not row: raise HTTPException(404, "Fahrzeug nicht gefunden")
     return serialize(row)
 
@@ -74,20 +83,30 @@ def history(vehicle_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/auctions/live")
 def live(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(Vehicle.status.in_(("active", "ending"))).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(Vehicle.auction_end_time)).all()
+    rows = db.scalars(vehicle_query().where(Vehicle.status.in_(("active", "ending"))).order_by(Vehicle.auction_end_time)).all()
     return [serialize(x) for x in rows]
 
 
 @app.get("/api/auctions/closed")
 def closed(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True)).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
+    rows = db.scalars(vehicle_query().where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
     return [serialize(x) for x in rows]
 
 
 @app.get("/api/opportunities")
-def opportunities(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(or_(Vehicle.status.in_(("active", "ending")), Vehicle.price_data_valid.is_(True))).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market))).all()
-    return sorted([serialize(x) for x in rows], key=lambda x: x["potential_profit"], reverse=True)
+def opportunities(include_avoid: bool = False, recommendation: str | None = None, db: Session = Depends(get_db)):
+    rows = db.scalars(vehicle_query().where(or_(Vehicle.status.in_(("active", "ending")), Vehicle.price_data_valid.is_(True)))).all()
+    items = [serialize(x) for x in rows]
+    allowed = {"KAUFEN", "PRÜFEN", "MEIDEN"}
+    if recommendation:
+        wanted = recommendation.upper()
+        if wanted not in allowed:
+            raise HTTPException(422, "Ungültiger Kaufentscheidungsfilter")
+        items = [x for x in items if x["purchase_recommendation"] == wanted]
+    elif not include_avoid:
+        items = [x for x in items if x["purchase_recommendation"] != "MEIDEN"]
+    rank = {"KAUFEN": 0, "PRÜFEN": 1, "MEIDEN": 2}
+    return sorted(items, key=lambda x: (rank.get(x["purchase_recommendation"], 9), -x["estimated_net_profit_aed"]))
 
 
 @app.post("/api/tracked-auctions")
@@ -124,7 +143,10 @@ def compare_autoscout(vehicle_id: int, x_admin_token: Annotated[str | None, Head
     if x_admin_token != settings.admin_token: raise HTTPException(401, "Ungültiger Admin-Schlüssel")
     row = db.get(Vehicle, vehicle_id)
     if not row: raise HTTPException(404, "Fahrzeug nicht gefunden")
-    if row.status != "finished" or not row.price_data_valid: raise HTTPException(409, "Der Marktvergleich ist nur für verlässliche Endpreise verfügbar")
+    if row.status not in ("active", "ending", "finished"):
+        raise HTTPException(409, "Für dieses Fahrzeug ist kein Marktvergleich verfügbar")
+    if row.status == "finished" and not row.price_data_valid:
+        raise HTTPException(409, "Der Marktvergleich ist nur für verlässliche Endpreise verfügbar")
     comparison = compare_vehicle(db, row)
     return {"status": comparison.status, "comparable_count": comparison.comparable_count}
 
