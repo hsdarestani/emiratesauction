@@ -36,4 +36,6 @@ def migrate():
             connection.execute(text("ALTER TABLE auction_results ALTER COLUMN final_bid DROP NOT NULL"))
         connection.execute(text("UPDATE vehicles SET last_live_bid = current_bid WHERE last_live_bid IS NULL"))
         connection.execute(text("UPDATE vehicles SET status = 'finalizing' WHERE status = 'closed'"))
+        if engine.dialect.name == "postgresql":
+            connection.execute(text("UPDATE vehicles SET next_poll_at = NULL WHERE status = 'finalizing' AND auction_end_time > NOW()"))
         connection.execute(text("UPDATE auction_results SET final_price_status = 'finalizing' WHERE final_price_status IS NULL"))
