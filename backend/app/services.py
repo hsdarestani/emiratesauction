@@ -11,6 +11,7 @@ def upsert_vehicle(db, payload, tracked=False):
     if not vehicle:
         vehicle = Vehicle(**{k: v for k, v in payload.items() if k != "images"}, is_tracked=tracked)
         vehicle.last_live_bid = payload["current_bid"]
+        vehicle.last_live_bid_at = datetime.now(timezone.utc)
         db.add(vehicle); db.flush()
     else:
         for key, value in payload.items():
@@ -18,6 +19,7 @@ def upsert_vehicle(db, payload, tracked=False):
                 setattr(vehicle, key, value)
         if payload["status"] in ("active", "ending"):
             vehicle.last_live_bid = payload["current_bid"]
+            vehicle.last_live_bid_at = datetime.now(timezone.utc)
         vehicle.is_tracked = vehicle.is_tracked or tracked
     previous = db.scalar(select(AuctionSnapshot).where(AuctionSnapshot.vehicle_id == vehicle.id).order_by(desc(AuctionSnapshot.timestamp)).limit(1))
     price, bids = Decimal(payload["current_bid"]), payload["bid_count"]
@@ -29,6 +31,12 @@ def upsert_vehicle(db, payload, tracked=False):
         if not exists: db.add(VehicleImage(vehicle_id=vehicle.id, url=url))
     db.commit(); db.refresh(vehicle)
     return vehicle
+
+
+def monitoring_is_valid(last_seen_at, finished_at, max_gap_seconds=5):
+    if not last_seen_at:
+        return False
+    return 0 <= (finished_at - last_seen_at).total_seconds() <= max_gap_seconds
 
 
 def poll_interval(end_time, now=None):
@@ -63,8 +71,33 @@ def update_one(db, vehicle, detail=None):
     payload = normalize({}, detail)
     expired = payload["status"] == "closed"
     if expired:
-        mark_finalizing(db, vehicle)
-        return "finished"
+        finished_at = datetime.now(timezone.utc)
+        previous_seen_at = vehicle.last_live_bid_at
+        gap = max(0, round((finished_at - previous_seen_at).total_seconds())) if previous_seen_at else None
+        valid = monitoring_is_valid(previous_seen_at, finished_at)
+        price = Decimal(payload["current_bid"])
+        previous = db.scalar(select(AuctionSnapshot).where(AuctionSnapshot.vehicle_id == vehicle.id).order_by(desc(AuctionSnapshot.timestamp)).limit(1))
+        if not previous or previous.current_bid != price or previous.bid_count != payload["bid_count"]:
+            jump = price - (previous.current_bid if previous else price)
+            db.add(AuctionSnapshot(vehicle_id=vehicle.id, current_bid=price, bid_count=payload["bid_count"], price_jump=jump))
+        vehicle.current_bid = price
+        vehicle.last_live_bid = price
+        vehicle.last_live_bid_at = finished_at
+        vehicle.bid_count = payload["bid_count"]
+        vehicle.auction_end_time = payload["auction_end_time"] or vehicle.auction_end_time
+        vehicle.finished_at = finished_at
+        vehicle.monitoring_gap_seconds = gap
+        vehicle.price_data_valid = valid
+        vehicle.price_source = "near_realtime_at_expiry" if valid else "monitoring_gap_at_expiry"
+        vehicle.status = "finished" if valid else "finished_unreliable"
+        result = db.scalar(select(AuctionResult).where(AuctionResult.vehicle_id == vehicle.id))
+        if not result:
+            result = AuctionResult(vehicle_id=vehicle.id, final_bid=price if valid else None)
+            db.add(result)
+        result.final_bid = price if valid else None
+        result.final_price_status = "observed" if valid else "unreliable"
+        db.commit()
+        return "finished_valid" if valid else "finished_unreliable"
     payload["status"] = "ending" if poll_interval(payload["auction_end_time"]) <= 5 else "active"
     updated = upsert_vehicle(db, payload, tracked=True)
     updated.next_poll_at = datetime.now(timezone.utc) + timedelta(seconds=poll_interval(updated.auction_end_time))

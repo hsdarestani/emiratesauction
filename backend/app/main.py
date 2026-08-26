@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, HttpUrl
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from .config import settings
@@ -38,15 +38,15 @@ def startup(): migrate()
 def serialize(v):
     data = {c.name: getattr(v, c.name) for c in v.__table__.columns}
     data.update(opportunity(v)); data["images"] = [x.url for x in v.images[:20]]
-    verified = v.result.verified_final_price if v.result else None
+    observed_final = v.result.final_bid if v.result and v.price_data_valid else None
     data["last_live_bid"] = float(v.last_live_bid or 0) if v.last_live_bid is not None else None
-    data["verified_final_price"] = float(verified) if verified is not None else None
-    data["final_bid"] = data["verified_final_price"]
+    data["verified_final_price"] = float(v.result.verified_final_price) if v.result and v.result.verified_final_price is not None else None
+    data["final_bid"] = float(observed_final) if observed_final is not None else None
     data["final_price_status"] = v.result.final_price_status if v.result else ("live" if v.status in ("active", "ending") else "finalizing")
     data["final_price_verified_at"] = v.result.final_price_verified_at if v.result else None
     data["final_price_source"] = v.result.final_price_source if v.result else None
-    data["sold_date"] = v.result.sold_date if v.result and v.status == "verified" else None
-    data["germany"] = serialize_comparison(v) if v.status == "verified" else None
+    data["sold_date"] = v.finished_at if v.price_data_valid else None
+    data["germany"] = serialize_comparison(v) if v.status == "finished" and v.price_data_valid else None
     return data
 
 
@@ -56,7 +56,7 @@ def health(): return {"status": "ok", "source": "Emirates Auction live API"}
 
 @app.get("/api/vehicles")
 def vehicles(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(Vehicle.auction_end_time)).all()
+    rows = db.scalars(select(Vehicle).where(or_(Vehicle.status.in_(("active", "ending")), Vehicle.price_data_valid.is_(True))).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(Vehicle.auction_end_time)).all()
     return [serialize(x) for x in rows]
 
 
@@ -80,13 +80,13 @@ def live(db: Session = Depends(get_db)):
 
 @app.get("/api/auctions/closed")
 def closed(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(Vehicle.status.in_(("finalizing", "verified", "verification_failed"))).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
+    rows = db.scalars(select(Vehicle).where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True)).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
     return [serialize(x) for x in rows]
 
 
 @app.get("/api/opportunities")
 def opportunities(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market))).all()
+    rows = db.scalars(select(Vehicle).where(or_(Vehicle.status.in_(("active", "ending")), Vehicle.price_data_valid.is_(True))).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market))).all()
     return sorted([serialize(x) for x in rows], key=lambda x: x["potential_profit"], reverse=True)
 
 
@@ -124,6 +124,13 @@ def compare_autoscout(vehicle_id: int, x_admin_token: Annotated[str | None, Head
     if x_admin_token != settings.admin_token: raise HTTPException(401, "Ungültiger Admin-Schlüssel")
     row = db.get(Vehicle, vehicle_id)
     if not row: raise HTTPException(404, "Fahrzeug nicht gefunden")
-    if row.status != "verified": raise HTTPException(409, "Der Marktvergleich ist erst nach bestätigtem Endpreis verfügbar")
+    if row.status != "finished" or not row.price_data_valid: raise HTTPException(409, "Der Marktvergleich ist nur für verlässliche Endpreise verfügbar")
     comparison = compare_vehicle(db, row)
     return {"status": comparison.status, "comparable_count": comparison.comparable_count}
+
+
+@app.get("/api/data-quality")
+def data_quality(db: Session = Depends(get_db)):
+    invalid = db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status.in_(("historical_unreliable", "finished_unreliable"))))
+    valid = db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True)))
+    return {"historisch_ungueltig": invalid or 0, "historisch_valide": valid or 0}

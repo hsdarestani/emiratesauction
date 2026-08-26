@@ -8,4 +8,4 @@ Geprüft am 26. August 2026 anhand der produktiven Emirates-Auction-Webseite und
 
 Der öffentliche Hub ist damit als echte Push-Quelle nachgewiesen. Die produktive Anwendung verwendet vorerst bewusst den offiziellen Detail-JSON mit adaptivem Polling, weil die ausgelieferten Bundles keine stabile, dokumentierte öffentliche Ereignis-Spezifikation für anonyme Preisnachrichten garantieren. So werden keine Ereignisse aufgrund erratener Methodennamen als Endpreise fehlinterpretiert.
 
-Ein Endpreis wird ausschließlich gesetzt, wenn die nach Ende erneut geladene offizielle Detailquelle `IsExpired=true` liefert. Das Verschwinden aus der Live-Liste reicht nicht aus.
+Ein beobachteter Endpreis wird gesetzt, sobald die offizielle Detailquelle `IsExpired=true` liefert. `last_live_bid` gilt dabei nur dann als verlässlich, wenn der vorherige erfolgreiche Live-Abruf höchstens fünf Sekunden zurückliegt. Das Verschwinden aus der Live-Liste reicht allein nicht aus. Historische Ergebnisse aus der früheren Fünf-Minuten-Logik werden nicht angezeigt oder analysiert.

@@ -61,8 +61,8 @@ def poll_vehicle(vehicle_id):
             if not vehicle or vehicle.status not in ("active", "ending"):
                 return "stale"
             state = update_one(db, vehicle)
-            if state == "finished":
-                verify_final_price_task.apply_async((vehicle_id, 0), countdown=2, queue="finalize")
+            if state == "finished_valid":
+                compare_finished_vehicle.delay(vehicle_id)
             return state
     finally:
         try: lock.release()
@@ -80,8 +80,8 @@ def verify_final_price_task(vehicle_id, attempt=0):
     try:
         with SessionLocal() as db:
             vehicle = db.get(Vehicle, vehicle_id)
-            if not vehicle or vehicle.status == "verified":
-                return "already_verified"
+            if not vehicle or vehicle.status != "finalizing":
+                return "stale"
             try:
                 outcome = verify_final_price(db, vehicle)
                 if outcome is True:
@@ -106,8 +106,8 @@ def compare_finished_vehicle(vehicle_id):
     from .autoscout import compare_vehicle
     with SessionLocal() as db:
         vehicle = db.get(Vehicle, vehicle_id)
-        if not vehicle or vehicle.status != "verified":
-            return "not_verified"
+        if not vehicle or vehicle.status != "finished" or not vehicle.price_data_valid:
+            return "nicht_valide"
         return compare_vehicle(db, vehicle).status
 
 

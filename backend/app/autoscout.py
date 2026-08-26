@@ -99,7 +99,8 @@ def compare_closed(db, limit=None):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.autoscout_refresh_hours)
     rows = db.scalars(
         select(Vehicle).outerjoin(GermanMarketComparison).where(
-            Vehicle.status == "verified",
+            Vehicle.status == "finished",
+            Vehicle.price_data_valid.is_(True),
             or_(GermanMarketComparison.id.is_(None), GermanMarketComparison.fetched_at < cutoff),
         ).order_by(Vehicle.auction_end_time.desc())
     ).all()

@@ -5,7 +5,11 @@ from .database import Base, engine
 
 VEHICLE_COLUMNS = {
     "last_live_bid": "NUMERIC(14,2)",
+    "last_live_bid_at": "TIMESTAMP WITH TIME ZONE",
     "finished_at": "TIMESTAMP WITH TIME ZONE",
+    "monitoring_gap_seconds": "INTEGER",
+    "price_data_valid": "BOOLEAN DEFAULT FALSE",
+    "price_source": "VARCHAR(80)",
     "next_poll_at": "TIMESTAMP WITH TIME ZONE",
 }
 RESULT_COLUMNS = {
@@ -25,6 +29,7 @@ def migrate():
         table: {column["name"] for column in inspector.get_columns(table)}
         for table in ("vehicles", "auction_results")
     }
+    first_quality_migration = "price_data_valid" not in existing["vehicles"]
     with engine.begin() as connection:
         for name, ddl in VEHICLE_COLUMNS.items():
             if name not in existing["vehicles"]:
@@ -35,8 +40,8 @@ def migrate():
         if engine.dialect.name == "postgresql":
             connection.execute(text("ALTER TABLE auction_results ALTER COLUMN final_bid DROP NOT NULL"))
         connection.execute(text("UPDATE vehicles SET last_live_bid = current_bid WHERE last_live_bid IS NULL"))
-        connection.execute(text("UPDATE vehicles SET status = 'finalizing' WHERE status = 'closed'"))
-        if engine.dialect.name == "postgresql":
-            connection.execute(text("UPDATE vehicles SET status = 'active', next_poll_at = NULL, finished_at = NULL WHERE status = 'finalizing' AND auction_end_time > NOW()"))
-            connection.execute(text("UPDATE auction_results ar SET final_bid = NULL, verified_final_price = NULL, final_price_verified_at = NULL, final_price_source = NULL, final_price_status = 'live' FROM vehicles v WHERE ar.vehicle_id = v.id AND v.status = 'active' AND v.auction_end_time > NOW() AND ar.final_price_status = 'finalizing'"))
+        if first_quality_migration:
+            connection.execute(text("UPDATE vehicles SET price_data_valid = FALSE"))
+            connection.execute(text("UPDATE vehicles SET status = 'historical_unreliable', price_source = 'legacy_5_minute_polling' WHERE status IN ('closed', 'finalizing', 'verified', 'verification_failed')"))
+            connection.execute(text("UPDATE auction_results SET final_price_status = 'historical_unreliable' WHERE final_price_status IN ('finalizing', 'verified') OR final_price_status IS NULL"))
         connection.execute(text("UPDATE auction_results SET final_price_status = 'finalizing' WHERE final_price_status IS NULL"))
