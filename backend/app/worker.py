@@ -7,12 +7,13 @@ from .config import settings
 from .database import Base, SessionLocal, engine
 from .models import Vehicle
 from .services import collect, poll_interval, update_one, verify_final_price
-from .autoscout import compare_closed
+from .autoscout import compare_closed, compare_live
 
 celery = Celery("auction", broker=settings.redis_url, backend=settings.redis_url)
 celery.conf.beat_schedule = {
     "poll-live-auctions": {"task": "poll_live_auctions", "schedule": settings.poll_interval_seconds},
     "dispatch-due-auctions": {"task": "dispatch_due_auctions", "schedule": 2.0},
+    "compare-live-with-germany": {"task": "compare_live_with_germany", "schedule": 300},
     "compare-finished-with-germany": {"task": "compare_finished_with_germany", "schedule": 1800},
 }
 celery.conf.task_acks_late = True
@@ -90,8 +91,6 @@ def verify_final_price_task(vehicle_id, attempt=0):
                 if outcome is None:
                     return "live"
             except Exception:
-                # The retry schedule below also covers timeouts and temporary
-                # Emirates Auction errors; the unverified value stays hidden.
                 pass
             delay = VERIFY_DELAYS[min(attempt + 1, len(VERIFY_DELAYS) - 1)]
             verify_final_price_task.apply_async((vehicle_id, attempt + 1), countdown=delay, queue="finalize")
@@ -109,6 +108,13 @@ def compare_finished_vehicle(vehicle_id):
         if not vehicle or vehicle.status != "finished" or not vehicle.price_data_valid:
             return "nicht_valide"
         return compare_vehicle(db, vehicle).status
+
+
+@celery.task(name="compare_live_with_germany")
+def compare_live_with_germany():
+    Base.metadata.create_all(engine)
+    with SessionLocal() as db:
+        return [{"vehicle_id": row.vehicle_id, "status": row.status} for row in compare_live(db)]
 
 
 @celery.task(name="compare_finished_with_germany")
