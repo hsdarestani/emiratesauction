@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     eur_aed_rate: float = 4.30
     autoscout_refresh_hours: int = 24
     autoscout_batch_size: int = 8
+    autoscout_live_refresh_hours: int = 6
+    autoscout_live_batch_size: int = 4
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
