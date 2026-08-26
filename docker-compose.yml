@@ -24,7 +24,7 @@ services:
     depends_on: {postgres: {condition: service_healthy}}
   worker:
     build: ./backend
-    command: celery -A app.worker.celery worker -B --loglevel=info
+    command: celery -A app.worker.celery worker -B -Q celery,live,finalize --loglevel=info
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+psycopg2://auction:${POSTGRES_PASSWORD:-auction-change-me}@postgres:5432/auction

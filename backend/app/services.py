@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from sqlalchemy import desc, select
 
@@ -9,11 +10,14 @@ def upsert_vehicle(db, payload, tracked=False):
     vehicle = db.scalar(select(Vehicle).where(Vehicle.lot_id == payload["lot_id"]))
     if not vehicle:
         vehicle = Vehicle(**{k: v for k, v in payload.items() if k != "images"}, is_tracked=tracked)
+        vehicle.last_live_bid = payload["current_bid"]
         db.add(vehicle); db.flush()
     else:
         for key, value in payload.items():
             if key != "images" and value is not None:
                 setattr(vehicle, key, value)
+        if payload["status"] in ("active", "ending"):
+            vehicle.last_live_bid = payload["current_bid"]
         vehicle.is_tracked = vehicle.is_tracked or tracked
     previous = db.scalar(select(AuctionSnapshot).where(AuctionSnapshot.vehicle_id == vehicle.id).order_by(desc(AuctionSnapshot.timestamp)).limit(1))
     price, bids = Decimal(payload["current_bid"]), payload["bid_count"]
@@ -23,11 +27,72 @@ def upsert_vehicle(db, payload, tracked=False):
     for url in payload.get("images", []):
         exists = db.scalar(select(VehicleImage).where(VehicleImage.vehicle_id == vehicle.id, VehicleImage.url == url))
         if not exists: db.add(VehicleImage(vehicle_id=vehicle.id, url=url))
-    if payload["status"] == "closed":
-        result = db.scalar(select(AuctionResult).where(AuctionResult.vehicle_id == vehicle.id))
-        if not result: db.add(AuctionResult(vehicle_id=vehicle.id, final_bid=price))
     db.commit(); db.refresh(vehicle)
     return vehicle
+
+
+def poll_interval(end_time, now=None):
+    now = now or datetime.now(timezone.utc)
+    if not end_time:
+        return 60
+    remaining = (end_time - now).total_seconds()
+    if remaining <= 60:
+        return 2
+    if remaining <= 5 * 60:
+        return 5
+    if remaining <= 30 * 60:
+        return 20
+    return 60
+
+
+def mark_finalizing(db, vehicle, now=None):
+    now = now or datetime.now(timezone.utc)
+    vehicle.status = "finalizing"
+    vehicle.finished_at = vehicle.finished_at or now
+    result = db.scalar(select(AuctionResult).where(AuctionResult.vehicle_id == vehicle.id))
+    if not result:
+        result = AuctionResult(vehicle_id=vehicle.id, final_bid=None, final_price_status="finalizing")
+        db.add(result)
+    db.commit()
+    return result
+
+
+def update_one(db, vehicle, detail=None):
+    """Poll one official detail page and make the end transition idempotently."""
+    detail = detail or fetch_detail(vehicle.lot_id)
+    payload = normalize({}, detail)
+    expired = payload["status"] == "closed"
+    if expired:
+        mark_finalizing(db, vehicle)
+        return "finished"
+    payload["status"] = "ending" if poll_interval(payload["auction_end_time"]) <= 5 else "active"
+    updated = upsert_vehicle(db, payload, tracked=True)
+    updated.next_poll_at = datetime.now(timezone.utc) + timedelta(seconds=poll_interval(updated.auction_end_time))
+    db.commit()
+    return "live"
+
+
+def verify_final_price(db, vehicle, detail=None):
+    """Publish a final price only when the official post-auction detail says expired."""
+    result = mark_finalizing(db, vehicle)
+    result.verification_attempts = (result.verification_attempts or 0) + 1
+    detail = detail or fetch_detail(vehicle.lot_id)
+    payload = normalize({}, detail)
+    if payload["status"] != "closed":
+        db.commit()
+        return False
+    price = Decimal(payload["current_bid"])
+    verified_at = datetime.now(timezone.utc)
+    vehicle.current_bid = price
+    vehicle.status = "verified"
+    vehicle.finished_at = vehicle.finished_at or verified_at
+    result.final_bid = price  # compatibility for existing consumers
+    result.verified_final_price = price
+    result.final_price_verified_at = verified_at
+    result.final_price_source = f"{vehicle.url} (__NEXT_DATA__.detailsData.Data; IsExpired=true)"
+    result.final_price_status = "verified"
+    db.commit()
+    return True
 
 
 def collect(db, limit=10):
@@ -57,11 +122,11 @@ def collect(db, limit=10):
         # disappear without being counted as historical vehicle results.
         if not is_quality_vehicle({"Title": vehicle.title}):
             vehicle.status = "ignored"; vehicle.is_tracked = False; db.commit(); continue
-        vehicle.status = "closed"
-        result = db.scalar(select(AuctionResult).where(AuctionResult.vehicle_id == vehicle.id))
-        if not result:
-            db.add(AuctionResult(vehicle_id=vehicle.id, final_bid=Decimal(vehicle.current_bid or 0)))
-        db.commit()
+        try:
+            update_one(db, vehicle)
+        except Exception:
+            # A transient list/detail outage must never fabricate an auction end.
+            continue
     return collected
 
 

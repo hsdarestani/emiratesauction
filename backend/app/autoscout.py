@@ -99,7 +99,7 @@ def compare_closed(db, limit=None):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.autoscout_refresh_hours)
     rows = db.scalars(
         select(Vehicle).outerjoin(GermanMarketComparison).where(
-            Vehicle.status == "closed",
+            Vehicle.status == "verified",
             or_(GermanMarketComparison.id.is_(None), GermanMarketComparison.fetched_at < cutoff),
         ).order_by(Vehicle.auction_end_time.desc())
     ).all()
@@ -111,7 +111,7 @@ def serialize_comparison(vehicle):
     if not row:
         return {"status": "pending"}
     result = vehicle.result
-    final_bid = Decimal(result.final_bid if result else vehicle.current_bid or 0)
+    final_bid = Decimal(result.verified_final_price if result and result.verified_final_price is not None else 0)
     market_aed = Decimal(row.median_price_eur or 0) * Decimal(row.eur_aed_rate or 0)
     gross = market_aed - final_bid
     net = gross - Decimal(vehicle.repair_estimate or 0) - Decimal(vehicle.import_cost or 0)

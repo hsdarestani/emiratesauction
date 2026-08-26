@@ -12,6 +12,7 @@ from .database import Base, engine, get_db
 from .models import AuctionSnapshot, MarketPrice, Vehicle
 from .autoscout import compare_vehicle, serialize_comparison
 from .services import collect, opportunity
+from .migrations import migrate
 
 app = FastAPI(title="Emirates Auction Intelligence", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
@@ -31,15 +32,21 @@ class ValuationIn(BaseModel):
 
 
 @app.on_event("startup")
-def startup(): Base.metadata.create_all(engine)
+def startup(): migrate()
 
 
 def serialize(v):
     data = {c.name: getattr(v, c.name) for c in v.__table__.columns}
     data.update(opportunity(v)); data["images"] = [x.url for x in v.images[:20]]
-    data["final_bid"] = float(v.result.final_bid) if v.result else (float(v.current_bid or 0) if v.status == "closed" else None)
+    verified = v.result.verified_final_price if v.result else None
+    data["last_live_bid"] = float(v.last_live_bid or 0) if v.last_live_bid is not None else None
+    data["verified_final_price"] = float(verified) if verified is not None else None
+    data["final_bid"] = data["verified_final_price"]
+    data["final_price_status"] = v.result.final_price_status if v.result else ("live" if v.status in ("active", "ending") else "finalizing")
+    data["final_price_verified_at"] = v.result.final_price_verified_at if v.result else None
+    data["final_price_source"] = v.result.final_price_source if v.result else None
     data["sold_date"] = v.result.sold_date if v.result else None
-    data["germany"] = serialize_comparison(v) if v.status == "closed" else None
+    data["germany"] = serialize_comparison(v) if v.status == "verified" else None
     return data
 
 
@@ -56,7 +63,7 @@ def vehicles(db: Session = Depends(get_db)):
 @app.get("/api/vehicles/{vehicle_id}")
 def vehicle(vehicle_id: int, db: Session = Depends(get_db)):
     row = db.scalar(select(Vehicle).where(Vehicle.id == vehicle_id).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)))
-    if not row: raise HTTPException(404, "Vehicle not found")
+    if not row: raise HTTPException(404, "Fahrzeug nicht gefunden")
     return serialize(row)
 
 
@@ -67,13 +74,13 @@ def history(vehicle_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/auctions/live")
 def live(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(Vehicle.status == "active").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(Vehicle.auction_end_time)).all()
+    rows = db.scalars(select(Vehicle).where(Vehicle.status.in_(("active", "ending"))).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(Vehicle.auction_end_time)).all()
     return [serialize(x) for x in rows]
 
 
 @app.get("/api/auctions/closed")
 def closed(db: Session = Depends(get_db)):
-    rows = db.scalars(select(Vehicle).where(Vehicle.status == "closed").options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
+    rows = db.scalars(select(Vehicle).where(Vehicle.status.in_(("finalizing", "verified", "verification_failed"))).options(selectinload(Vehicle.images), selectinload(Vehicle.market_prices), selectinload(Vehicle.result), selectinload(Vehicle.german_market)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
     return [serialize(x) for x in rows]
 
 
@@ -85,10 +92,10 @@ def opportunities(db: Session = Depends(get_db)):
 
 @app.post("/api/tracked-auctions")
 def track(body: TrackIn, x_admin_token: Annotated[str | None, Header()] = None, db: Session = Depends(get_db)):
-    if x_admin_token != settings.admin_token: raise HTTPException(401, "Invalid admin token")
+    if x_admin_token != settings.admin_token: raise HTTPException(401, "Ungültiger Admin-Schlüssel")
     import re
     match = re.search(r"/vehicles/(\d+)", str(body.lot_url))
-    if not match: raise HTTPException(422, "Invalid Emirates Auction vehicle URL")
+    if not match: raise HTTPException(422, "Ungültige Emirates-Auction-Fahrzeug-URL")
     from .scraper import fetch_detail, normalize
     from .services import upsert_vehicle
     row = upsert_vehicle(db, normalize({}, fetch_detail(match.group(1))), tracked=True)
@@ -98,9 +105,9 @@ def track(body: TrackIn, x_admin_token: Annotated[str | None, Header()] = None, 
 
 @app.post("/api/vehicles/{vehicle_id}/valuation")
 def valuation(vehicle_id: int, body: ValuationIn, x_admin_token: Annotated[str | None, Header()] = None, db: Session = Depends(get_db)):
-    if x_admin_token != settings.admin_token: raise HTTPException(401, "Invalid admin token")
+    if x_admin_token != settings.admin_token: raise HTTPException(401, "Ungültiger Admin-Schlüssel")
     row = db.get(Vehicle, vehicle_id)
-    if not row: raise HTTPException(404, "Vehicle not found")
+    if not row: raise HTTPException(404, "Fahrzeug nicht gefunden")
     row.repair_estimate, row.import_cost = body.repair_estimate, body.import_cost
     db.add(MarketPrice(vehicle_id=row.id, source=body.source, market_price=body.market_price)); db.commit()
     return {"ok": True}
@@ -108,15 +115,15 @@ def valuation(vehicle_id: int, body: ValuationIn, x_admin_token: Annotated[str |
 
 @app.post("/api/admin/collect-now")
 def collect_now(x_admin_token: Annotated[str | None, Header()] = None, db: Session = Depends(get_db)):
-    if x_admin_token != settings.admin_token: raise HTTPException(401, "Invalid admin token")
+    if x_admin_token != settings.admin_token: raise HTTPException(401, "Ungültiger Admin-Schlüssel")
     return {"lots": [v.lot_id for v in collect(db, settings.poll_limit)]}
 
 
 @app.post("/api/admin/compare-autoscout/{vehicle_id}")
 def compare_autoscout(vehicle_id: int, x_admin_token: Annotated[str | None, Header()] = None, db: Session = Depends(get_db)):
-    if x_admin_token != settings.admin_token: raise HTTPException(401, "Invalid admin token")
+    if x_admin_token != settings.admin_token: raise HTTPException(401, "Ungültiger Admin-Schlüssel")
     row = db.get(Vehicle, vehicle_id)
-    if not row: raise HTTPException(404, "Vehicle not found")
-    if row.status != "closed": raise HTTPException(409, "Comparison is available after the auction finishes")
+    if not row: raise HTTPException(404, "Fahrzeug nicht gefunden")
+    if row.status != "verified": raise HTTPException(409, "Der Marktvergleich ist erst nach bestätigtem Endpreis verfügbar")
     comparison = compare_vehicle(db, row)
     return {"status": comparison.status, "comparable_count": comparison.comparable_count}

@@ -16,7 +16,7 @@ if [ ! -f .env ]; then
   sed -i "s/change-me/$(openssl rand -hex 24)/g" .env
 fi
 docker compose up -d --build --remove-orphans
-docker compose exec -T backend python -c 'from app.database import Base,engine; Base.metadata.create_all(engine)'
+docker compose exec -T backend python -c 'from app.migrations import migrate; migrate()'
 docker compose exec -T backend python -c 'from app.database import SessionLocal; from app.services import collect; db=SessionLocal(); print([v.lot_id for v in collect(db,10)]); db.close()'
 docker compose exec -T backend python -c 'from app.database import SessionLocal; from app.autoscout import compare_closed; db=SessionLocal(); print([x.vehicle_id for x in compare_closed(db,8)]); db.close()'
 if [ ! -f /etc/letsencrypt/live/emiratesauction.smarbiz.sbs/fullchain.pem ]; then

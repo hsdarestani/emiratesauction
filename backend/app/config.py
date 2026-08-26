@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     ea_api_url: str = "https://apiv8.emiratesauction.net"
     ea_site_url: str = "https://www.emiratesauction.com"
     poll_limit: int = 10
-    poll_interval_seconds: int = 300
+    poll_interval_seconds: int = 60
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     admin_token: str = "change-me"
