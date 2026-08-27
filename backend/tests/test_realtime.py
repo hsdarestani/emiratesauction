@@ -55,8 +55,8 @@ def test_last_five_minutes_use_dedicated_closing_queue():
     assert closing_queue_for(SimpleNamespace(auction_end_time=None), now) == "live"
 
 
-def test_closing_feed_only_trusts_a_recent_observation():
+def test_closing_feed_tolerates_measured_api_latency_but_stays_tight():
     observed = datetime.now(timezone.utc)
-    assert closing_observation_is_valid(observed - timedelta(seconds=8), observed)
-    assert not closing_observation_is_valid(observed - timedelta(seconds=9), observed)
+    assert closing_observation_is_valid(observed - timedelta(seconds=12), observed)
+    assert not closing_observation_is_valid(observed - timedelta(seconds=13), observed)
     assert not closing_observation_is_valid(None, observed)
