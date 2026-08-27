@@ -50,10 +50,43 @@ def serialize(v):
     return data
 
 
+def serialize_card(v):
+    """Small payload for frequently refreshed dashboard cards.
+
+    Full purchase analysis, inspection fields and galleries are intentionally
+    loaded only when the vehicle detail/opportunity endpoints are requested.
+    This keeps the 2-second live feed cheap even with hundreds of tracked lots.
+    """
+    observed_final = v.result.final_bid if v.result and v.price_data_valid else None
+    return {
+        "id": v.id,
+        "lot_id": v.lot_id,
+        "title": v.title,
+        "status": v.status,
+        "current_bid": float(v.current_bid or 0),
+        "final_bid": float(observed_final) if observed_final is not None else None,
+        "bid_count": v.bid_count or 0,
+        "auction_end_time": v.auction_end_time,
+        "updated_at": v.updated_at,
+        "condition_tags": v.condition_tags or [],
+        "images": [v.images[0].url] if v.images else [],
+        "price_data_valid": bool(v.price_data_valid),
+        "germany": serialize_comparison(v),
+    }
+
+
 def vehicle_query():
     return select(Vehicle).options(
         selectinload(Vehicle.images),
         selectinload(Vehicle.market_prices),
+        selectinload(Vehicle.result),
+        selectinload(Vehicle.german_market),
+    )
+
+
+def card_query():
+    return select(Vehicle).options(
+        selectinload(Vehicle.images),
         selectinload(Vehicle.result),
         selectinload(Vehicle.german_market),
     )
@@ -83,14 +116,14 @@ def history(vehicle_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/auctions/live")
 def live(db: Session = Depends(get_db)):
-    rows = db.scalars(vehicle_query().where(Vehicle.status.in_(("active", "ending"))).order_by(Vehicle.auction_end_time)).all()
-    return [serialize(x) for x in rows]
+    rows = db.scalars(card_query().where(Vehicle.status.in_(("active", "ending"))).order_by(Vehicle.auction_end_time)).all()
+    return [serialize_card(x) for x in rows]
 
 
 @app.get("/api/auctions/closed")
 def closed(db: Session = Depends(get_db)):
-    rows = db.scalars(vehicle_query().where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
-    return [serialize(x) for x in rows]
+    rows = db.scalars(card_query().where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
+    return [serialize_card(x) for x in rows]
 
 
 @app.get("/api/opportunities")
