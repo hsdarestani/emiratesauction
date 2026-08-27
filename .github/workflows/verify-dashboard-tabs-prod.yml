@@ -1,0 +1,28 @@
+name: Verify dashboard tabs production
+on:
+  push:
+    branches: [ops/verify-dashboard-tabs-prod]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify served dashboard assets
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -e
+            cd /opt/emiratesauction
+            docker compose ps
+            html="$(curl -fsS http://127.0.0.1:8087/)"
+            echo "$html" | grep -q 'workspace-tabs'
+            echo "$html" | grep -q 'Kaufchancen'
+            echo "$html" | grep -q 'Beendet'
+            echo "$html" | grep -q 'app.js?v=9'
+            js="$(curl -fsS http://127.0.0.1:8087/app.js?v=9)"
+            echo "$js" | grep -q 'switchMainTab'
+            echo "$js" | grep -q 'Mehr anzeigen'
+            echo 'dashboard_tabs_production=ok'
