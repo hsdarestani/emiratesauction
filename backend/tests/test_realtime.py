@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.services import monitoring_is_valid, poll_interval, resolve_closing_price
-from app.worker import closing_queue_for
+from app.worker import closing_observation_is_valid, closing_queue_for
 
 
 def test_adaptive_poll_intervals():
@@ -53,3 +53,10 @@ def test_last_five_minutes_use_dedicated_closing_queue():
     assert closing_queue_for(SimpleNamespace(auction_end_time=now + timedelta(minutes=4)), now) == "closing"
     assert closing_queue_for(SimpleNamespace(auction_end_time=now + timedelta(minutes=8)), now) == "live"
     assert closing_queue_for(SimpleNamespace(auction_end_time=None), now) == "live"
+
+
+def test_closing_feed_only_trusts_a_recent_observation():
+    observed = datetime.now(timezone.utc)
+    assert closing_observation_is_valid(observed - timedelta(seconds=8), observed)
+    assert not closing_observation_is_valid(observed - timedelta(seconds=9), observed)
+    assert not closing_observation_is_valid(None, observed)
