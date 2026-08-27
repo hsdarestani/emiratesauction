@@ -9,7 +9,9 @@ from .models import Vehicle
 from .services import collect, poll_interval, update_one, verify_final_price
 from .autoscout import compare_closed, compare_live
 
-celery = Celery("auction", broker=settings.redis_url, backend=settings.redis_url)
+# Tasks are fire-and-forget. Keeping every Celery result in the same Redis
+# instance as the broker caused Redis to grow until the small VPS hit OOM.
+celery = Celery("auction", broker=settings.redis_url)
 celery.conf.beat_schedule = {
     "poll-live-auctions": {"task": "poll_live_auctions", "schedule": settings.poll_interval_seconds},
     "dispatch-due-auctions": {"task": "dispatch_due_auctions", "schedule": 2.0},
@@ -20,6 +22,9 @@ celery.conf.beat_schedule = {
 celery.conf.task_acks_late = True
 celery.conf.task_reject_on_worker_lost = True
 celery.conf.worker_prefetch_multiplier = 1
+celery.conf.task_ignore_result = True
+celery.conf.task_store_errors_even_if_ignored = False
+celery.conf.broker_connection_retry_on_startup = True
 redis = Redis.from_url(settings.redis_url)
 
 CLOSING_WINDOW_SECONDS = 5 * 60
