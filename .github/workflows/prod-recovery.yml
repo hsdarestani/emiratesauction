@@ -1,4 +1,4 @@
-name: Production diagnostics and recovery
+name: Production emergency recovery
 on:
   push:
     branches: [ops/prod-recovery]
@@ -7,52 +7,40 @@ jobs:
   recover:
     runs-on: ubuntu-latest
     steps:
-      - name: Diagnose and recover over SSH
+      - name: Relieve memory pressure and recover web service
         uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.HOST }}
           username: root
           password: ${{ secrets.PASS }}
-          command_timeout: 5m
+          timeout: 30s
+          command_timeout: 3m
           script: |
             set -u
-            echo '=== UPTIME ==='
-            uptime || true
-            echo '=== MEMORY ==='
-            free -h || true
-            echo '=== DISK ==='
-            df -h / /var/lib/docker 2>/dev/null || df -h || true
-            echo '=== NGINX ==='
-            systemctl is-active nginx || true
-            nginx -t || true
-            echo '=== COMPOSE ==='
             cd /opt/emiratesauction
+            echo '=== BEFORE ==='
+            uptime || true
+            free -h || true
             docker compose ps || true
-            echo '=== CONTAINER STATS ==='
-            docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' 2>/dev/null || true
-            echo '=== RECENT OOM ==='
-            journalctl -k --since '-30 min' --no-pager 2>/dev/null | grep -Ei 'oom|out of memory|killed process' | tail -40 || true
-            echo '=== LOCAL FRONTEND BEFORE ==='
-            curl -sS -m 8 -o /dev/null -w 'frontend_http=%{http_code} time=%{time_total}\n' http://127.0.0.1:8087/ || true
-            echo '=== LOCAL HTTPS BEFORE ==='
-            curl -k -sS -m 8 --resolve emiratesauction.smarbiz.sbs:443:127.0.0.1 -o /dev/null -w 'https_http=%{http_code} time=%{time_total}\n' https://emiratesauction.smarbiz.sbs/ || true
 
-            if ! curl -fsS -m 8 http://127.0.0.1:8087/ >/dev/null; then
-              echo 'Frontend unhealthy: recreating frontend/backend'
-              docker compose up -d --no-build backend frontend
-            fi
+            echo 'Stopping background auction workers temporarily to free RAM'
+            docker compose stop worker closing-worker beat || true
+            sleep 2
 
-            if ! systemctl is-active --quiet nginx; then
-              echo 'Host nginx inactive: restarting'
-              systemctl restart nginx
-            else
-              nginx -t && systemctl reload nginx
-            fi
-
+            echo 'Resetting ephemeral Celery Redis state'
+            docker compose restart redis || true
             sleep 3
-            echo '=== LOCAL HEALTH AFTER ==='
-            curl -sS -m 8 -o /dev/null -w 'frontend_http=%{http_code} time=%{time_total}\n' http://127.0.0.1:8087/ || true
-            curl -k -sS -m 8 --resolve emiratesauction.smarbiz.sbs:443:127.0.0.1 -o /dev/null -w 'https_http=%{http_code} time=%{time_total}\n' https://emiratesauction.smarbiz.sbs/ || true
-            curl -sS -m 8 -o /dev/null -w 'api_health_http=%{http_code} time=%{time_total}\n' http://127.0.0.1:8087/api/health || true
-            echo '=== FINAL COMPOSE ==='
+            docker compose exec -T redis redis-cli FLUSHDB || true
+
+            echo 'Ensuring web stack is alive'
+            docker compose up -d --no-build postgres redis backend frontend
+            systemctl restart nginx
+            sleep 5
+
+            echo '=== HEALTH ==='
+            free -h || true
+            uptime || true
+            curl -fsS -m 10 http://127.0.0.1:8087/ >/dev/null && echo 'frontend=OK' || echo 'frontend=FAIL'
+            curl -fsS -m 10 http://127.0.0.1:8087/api/health && echo || true
+            curl -kfsS -m 10 --resolve emiratesauction.smarbiz.sbs:443:127.0.0.1 https://emiratesauction.smarbiz.sbs/ >/dev/null && echo 'https=OK' || echo 'https=FAIL'
             docker compose ps || true
