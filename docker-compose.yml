@@ -2,6 +2,7 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    mem_limit: 384m
     environment:
       POSTGRES_DB: auction
       POSTGRES_USER: auction
@@ -11,9 +12,12 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    mem_limit: 224m
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "192mb", "--maxmemory-policy", "noeviction"]
   backend:
     build: ./backend
     restart: unless-stopped
+    mem_limit: 384m
     environment:
       DATABASE_URL: postgresql+psycopg2://auction:${POSTGRES_PASSWORD:-auction-change-me}@postgres:5432/auction
       REDIS_URL: redis://redis:6379/0
@@ -24,8 +28,9 @@ services:
     depends_on: {postgres: {condition: service_healthy}}
   worker:
     build: ./backend
-    command: celery -A app.worker.celery worker -Q celery,live,finalize --concurrency=4 --prefetch-multiplier=1 --loglevel=info
+    command: celery -A app.worker.celery worker -Q celery,live,finalize --pool=threads --concurrency=6 --prefetch-multiplier=1 --without-gossip --without-mingle --loglevel=info
     restart: unless-stopped
+    mem_limit: 320m
     environment:
       DATABASE_URL: postgresql+psycopg2://auction:${POSTGRES_PASSWORD:-auction-change-me}@postgres:5432/auction
       REDIS_URL: redis://redis:6379/0
@@ -33,8 +38,9 @@ services:
     depends_on: [backend, redis]
   closing-worker:
     build: ./backend
-    command: celery -A app.worker.celery worker -Q closing --pool=threads --concurrency=12 --prefetch-multiplier=1 --loglevel=info
+    command: celery -A app.worker.celery worker -Q closing --pool=threads --concurrency=8 --prefetch-multiplier=1 --without-gossip --without-mingle --loglevel=info
     restart: unless-stopped
+    mem_limit: 256m
     environment:
       DATABASE_URL: postgresql+psycopg2://auction:${POSTGRES_PASSWORD:-auction-change-me}@postgres:5432/auction
       REDIS_URL: redis://redis:6379/0
@@ -44,6 +50,7 @@ services:
     build: ./backend
     command: celery -A app.worker.celery beat --loglevel=info
     restart: unless-stopped
+    mem_limit: 160m
     environment:
       DATABASE_URL: postgresql+psycopg2://auction:${POSTGRES_PASSWORD:-auction-change-me}@postgres:5432/auction
       REDIS_URL: redis://redis:6379/0
@@ -52,6 +59,7 @@ services:
   frontend:
     build: ./frontend
     restart: unless-stopped
+    mem_limit: 64m
     ports: ["127.0.0.1:8087:80"]
     depends_on: [backend]
 volumes: {postgres_data: {}}
