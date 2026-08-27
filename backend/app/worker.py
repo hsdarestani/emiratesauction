@@ -40,8 +40,12 @@ redis = Redis.from_url(settings.redis_url)
 
 CLOSING_WINDOW_SECONDS = 5 * 60
 QUEUE_MARKER_TTL_SECONDS = 45
-CLOSING_MISS_CONFIRMATIONS = 2
-CLOSING_OBSERVATION_MAX_GAP_SECONDS = 8
+# The official Vehicles feed currently takes roughly five seconds per full
+# snapshot in production. One healthy post-EndDate absence is therefore enough
+# when we observed the lot immediately beforehand; requiring two misses made the
+# evidence artificially stale before finalization.
+CLOSING_MISS_CONFIRMATIONS = 1
+CLOSING_OBSERVATION_MAX_GAP_SECONDS = 12
 MIN_HEALTHY_ACTIVE_FEED_SIZE = 100
 
 
@@ -102,8 +106,8 @@ def poll_closing_feed():
 
     The Vehicles API only exposes active lots. While a lot is present we store
     its latest bid and any extended EndDate. Once its known end time has passed
-    and it is absent from two consecutive healthy snapshots, the immediately
-    preceding API bid becomes our observed end price.
+    and it is absent from a healthy snapshot, the immediately preceding API bid
+    becomes our observed end price, provided that observation is still recent.
     """
     lock = redis.lock("auction:closing-feed", timeout=12, blocking_timeout=0)
     if not lock.acquire(blocking=False):
