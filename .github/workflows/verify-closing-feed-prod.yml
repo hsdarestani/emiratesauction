@@ -6,7 +6,7 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Inspect production closing feed result
+      - name: Inspect production after latency tuning
         uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.HOST }}
@@ -16,15 +16,28 @@ jobs:
           script: |
             set -e
             cd /opt/emiratesauction
+            echo '=== COMPOSE ==='
+            docker compose ps
+            echo '=== QUALITY / CLOSED ==='
+            curl -fsS http://127.0.0.1:8087/api/data-quality; echo
+            curl -fsS http://127.0.0.1:8087/api/auctions/closed | python3 -c 'import json,sys; r=json.load(sys.stdin); print("closed_count=",len(r)); [print(x.get("lot_id"),x.get("title"),x.get("final_bid"),x.get("price_data_valid")) for x in r[:10]]'
+            echo '=== NEXT TRACKED AUCTIONS ==='
             docker compose exec -T backend python - <<'PY'
+            from datetime import datetime, timezone
             from sqlalchemy import select
             from app.database import SessionLocal
             from app.models import Vehicle
+            now=datetime.now(timezone.utc)
             with SessionLocal() as db:
                 rows=db.scalars(select(Vehicle).where(
-                    Vehicle.price_source.in_(("emirates_live_api_closing_feed","closing_feed_monitoring_gap"))
-                ).order_by(Vehicle.finished_at.desc().nullslast()).limit(10)).all()
-                print('closing_feed_results=',len(rows))
+                    Vehicle.is_tracked.is_(True),
+                    Vehicle.status.in_(("active","ending")),
+                    Vehicle.auction_end_time.is_not(None),
+                ).order_by(Vehicle.auction_end_time).limit(12)).all()
+                print('active_tracked_sample=',len(rows))
                 for v in rows:
-                    print(v.lot_id, v.title, 'status=',v.status, 'valid=',v.price_data_valid, 'source=',v.price_source, 'gap=',v.monitoring_gap_seconds, 'bid=',v.last_live_bid, 'seen=',v.last_live_bid_at, 'finished=',v.finished_at, 'end=',v.auction_end_time)
+                    remaining=round((v.auction_end_time-now).total_seconds())
+                    print(v.lot_id, v.title, 'remaining_s=',remaining, 'bid=',v.last_live_bid, 'seen=',v.last_live_bid_at, 'status=',v.status)
             PY
+            echo '=== CLOSING LOG ==='
+            docker compose logs --tail=100 closing-worker | tail -100
