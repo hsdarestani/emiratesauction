@@ -1,0 +1,58 @@
+name: Production diagnostics and recovery
+on:
+  push:
+    branches: [ops/prod-recovery]
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Diagnose and recover over SSH
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.HOST }}
+          username: root
+          password: ${{ secrets.PASS }}
+          command_timeout: 5m
+          script: |
+            set -u
+            echo '=== UPTIME ==='
+            uptime || true
+            echo '=== MEMORY ==='
+            free -h || true
+            echo '=== DISK ==='
+            df -h / /var/lib/docker 2>/dev/null || df -h || true
+            echo '=== NGINX ==='
+            systemctl is-active nginx || true
+            nginx -t || true
+            echo '=== COMPOSE ==='
+            cd /opt/emiratesauction
+            docker compose ps || true
+            echo '=== CONTAINER STATS ==='
+            docker stats --no-stream --format '{{.Name}} {{.CPUPerc}} {{.MemUsage}}' 2>/dev/null || true
+            echo '=== RECENT OOM ==='
+            journalctl -k --since '-30 min' --no-pager 2>/dev/null | grep -Ei 'oom|out of memory|killed process' | tail -40 || true
+            echo '=== LOCAL FRONTEND BEFORE ==='
+            curl -sS -m 8 -o /dev/null -w 'frontend_http=%{http_code} time=%{time_total}\n' http://127.0.0.1:8087/ || true
+            echo '=== LOCAL HTTPS BEFORE ==='
+            curl -k -sS -m 8 --resolve emiratesauction.smarbiz.sbs:443:127.0.0.1 -o /dev/null -w 'https_http=%{http_code} time=%{time_total}\n' https://emiratesauction.smarbiz.sbs/ || true
+
+            if ! curl -fsS -m 8 http://127.0.0.1:8087/ >/dev/null; then
+              echo 'Frontend unhealthy: recreating frontend/backend'
+              docker compose up -d --no-build backend frontend
+            fi
+
+            if ! systemctl is-active --quiet nginx; then
+              echo 'Host nginx inactive: restarting'
+              systemctl restart nginx
+            else
+              nginx -t && systemctl reload nginx
+            fi
+
+            sleep 3
+            echo '=== LOCAL HEALTH AFTER ==='
+            curl -sS -m 8 -o /dev/null -w 'frontend_http=%{http_code} time=%{time_total}\n' http://127.0.0.1:8087/ || true
+            curl -k -sS -m 8 --resolve emiratesauction.smarbiz.sbs:443:127.0.0.1 -o /dev/null -w 'https_http=%{http_code} time=%{time_total}\n' https://emiratesauction.smarbiz.sbs/ || true
+            curl -sS -m 8 -o /dev/null -w 'api_health_http=%{http_code} time=%{time_total}\n' http://127.0.0.1:8087/api/health || true
+            echo '=== FINAL COMPOSE ==='
+            docker compose ps || true
