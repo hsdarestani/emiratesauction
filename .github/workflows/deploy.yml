@@ -23,7 +23,13 @@ jobs:
           host: ${{ secrets.HOST }}
           username: root
           password: ${{ secrets.PASS }}
+          command_timeout: 10m
           script: |
             mkdir -p /opt
-            if [ ! -d /opt/emiratesauction/.git ]; then git clone https://github.com/hsdarestani/emiratesauction.git /opt/emiratesauction; fi
-            bash /opt/emiratesauction/deploy/deploy.sh
+            if [ ! -d /opt/emiratesauction/.git ]; then
+              git clone https://github.com/hsdarestani/emiratesauction.git /opt/emiratesauction
+            fi
+            cd /opt/emiratesauction
+            git fetch origin main
+            git reset --hard origin/main
+            bash deploy/deploy.sh
