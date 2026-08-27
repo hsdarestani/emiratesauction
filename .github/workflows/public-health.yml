@@ -1,0 +1,15 @@
+name: Public production health check
+on:
+  push:
+    branches: [ops/public-health-check]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check production from outside VPS
+        run: |
+          set -euxo pipefail
+          getent ahostsv4 emiratesauction.smarbiz.sbs
+          curl --fail --show-error --location --connect-timeout 10 --max-time 20 -o /tmp/home.html -w 'home_http=%{http_code} total=%{time_total}\n' https://emiratesauction.smarbiz.sbs/
+          grep -q 'Auktionsanalyse' /tmp/home.html
+          curl --fail --show-error --location --connect-timeout 10 --max-time 20 -w '\napi_http=%{http_code} total=%{time_total}\n' https://emiratesauction.smarbiz.sbs/api/health
