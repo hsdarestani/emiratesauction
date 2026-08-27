@@ -7,7 +7,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Inspect production data over SSH
+      - name: Inspect production workers over SSH
         uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.HOST }}
@@ -15,28 +15,20 @@ jobs:
           password: ${{ secrets.PASS }}
           command_timeout: 3m
           script: |
-            set -e
+            set -u
             cd /opt/emiratesauction
             echo '=== DATA QUALITY ==='
-            curl -fsS http://127.0.0.1:8087/api/data-quality
+            curl -fsS http://127.0.0.1:8087/api/data-quality || true
             echo
-            echo '=== CLOSED AUCTIONS SUMMARY ==='
-            curl -fsS http://127.0.0.1:8087/api/auctions/closed | python3 -c '
-            import json,sys
-            rows=json.load(sys.stdin)
-            print("closed_count=", len(rows))
-            filled=[r for r in rows if r.get("final_bid") not in (None,0)]
-            empty=[r for r in rows if r.get("final_bid") in (None,0)]
-            print("final_bid_filled=", len(filled))
-            print("final_bid_empty=", len(empty))
-            print("examples_filled=")
-            for r in filled[:10]:
-                print(r.get("lot_id"), r.get("title"), r.get("final_bid"), r.get("status"), r.get("price_data_valid"))
-            print("examples_empty=")
-            for r in empty[:10]:
-                print(r.get("lot_id"), r.get("title"), r.get("final_bid"), r.get("status"), r.get("price_data_valid"))
-            '
-            echo '=== SERVER MEMORY ==='
-            free -h
-            echo '=== CONTAINERS ==='
-            docker compose ps
+            echo '=== COMPOSE ==='
+            docker compose ps || true
+            echo '=== WORKER STATE ==='
+            docker inspect emiratesauction-worker-1 --format 'Status={{.State.Status}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}} RestartCount={{.RestartCount}}' || true
+            echo '=== CLOSING WORKER STATE ==='
+            docker inspect emiratesauction-closing-worker-1 --format 'Status={{.State.Status}} ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} Error={{.State.Error}} RestartCount={{.RestartCount}}' || true
+            echo '=== WORKER LOG ==='
+            docker compose logs --tail=120 worker || true
+            echo '=== CLOSING WORKER LOG ==='
+            docker compose logs --tail=120 closing-worker || true
+            echo '=== REDIS INFO ==='
+            docker compose exec -T redis redis-cli INFO memory | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy' || true
