@@ -41,6 +41,26 @@ def monitoring_is_valid(last_seen_at, finished_at, max_gap_seconds=5):
     return 0 <= (finished_at - last_seen_at).total_seconds() <= max_gap_seconds
 
 
+def resolve_closing_price(detail_price, last_live_bid, last_seen_at, observed_at, max_gap_seconds=5):
+    """Choose the best observed closing price without inventing a result.
+
+    Emirates Auction's official detail payload can keep CurrentPriceStr available
+    after IsExpired becomes true. That value is stronger evidence than our queue
+    timing, so it remains usable even if a worker reached the expiry response a
+    few seconds late. If the expired detail hides the price, only a tightly
+    observed pre-expiry live bid may be used.
+    """
+    official = Decimal(detail_price or 0)
+    fallback = Decimal(last_live_bid or 0)
+    if official > 0:
+        return official, True, "emirates_expired_detail"
+    if fallback > 0 and monitoring_is_valid(last_seen_at, observed_at, max_gap_seconds):
+        return fallback, True, "near_realtime_at_expiry"
+    if fallback > 0:
+        return fallback, False, "monitoring_gap_at_expiry"
+    return Decimal(0), False, "missing_closing_price"
+
+
 def poll_interval(end_time, now=None):
     now = now or datetime.now(timezone.utc)
     if not end_time:
@@ -73,24 +93,34 @@ def update_one(db, vehicle, detail=None):
     payload = normalize({}, detail)
     expired = payload["status"] == "closed"
     if expired:
-        finished_at = datetime.now(timezone.utc)
+        observed_at = datetime.now(timezone.utc)
         previous_seen_at = vehicle.last_live_bid_at
-        gap = max(0, round((finished_at - previous_seen_at).total_seconds())) if previous_seen_at else None
-        valid = monitoring_is_valid(previous_seen_at, finished_at)
-        price = Decimal(payload["current_bid"])
+        gap = max(0, round((observed_at - previous_seen_at).total_seconds())) if previous_seen_at else None
+        detail_price = Decimal(payload["current_bid"] or 0)
+        price, valid, source = resolve_closing_price(
+            detail_price,
+            vehicle.last_live_bid or vehicle.current_bid,
+            previous_seen_at,
+            observed_at,
+        )
+        bids = payload["bid_count"] if payload["bid_count"] else vehicle.bid_count
         previous = db.scalar(select(AuctionSnapshot).where(AuctionSnapshot.vehicle_id == vehicle.id).order_by(desc(AuctionSnapshot.timestamp)).limit(1))
-        if not previous or previous.current_bid != price or previous.bid_count != payload["bid_count"]:
+        if price > 0 and (not previous or previous.current_bid != price or previous.bid_count != bids):
             jump = price - (previous.current_bid if previous else price)
-            db.add(AuctionSnapshot(vehicle_id=vehicle.id, current_bid=price, bid_count=payload["bid_count"], price_jump=jump))
-        vehicle.current_bid = price
-        vehicle.last_live_bid = price
-        vehicle.last_live_bid_at = finished_at
-        vehicle.bid_count = payload["bid_count"]
+            db.add(AuctionSnapshot(vehicle_id=vehicle.id, current_bid=price, bid_count=bids, price_jump=jump))
+        if price > 0:
+            vehicle.current_bid = price
+            vehicle.last_live_bid = price
+        # Preserve the true pre-expiry live observation timestamp when we had to
+        # fall back to it; an after-expiry fetch must not make old evidence look fresh.
+        if detail_price > 0:
+            vehicle.last_live_bid_at = observed_at
+        vehicle.bid_count = bids
         vehicle.auction_end_time = payload["auction_end_time"] or vehicle.auction_end_time
-        vehicle.finished_at = finished_at
+        vehicle.finished_at = vehicle.finished_at or observed_at
         vehicle.monitoring_gap_seconds = gap
         vehicle.price_data_valid = valid
-        vehicle.price_source = "near_realtime_at_expiry" if valid else "monitoring_gap_at_expiry"
+        vehicle.price_source = source
         vehicle.status = "finished" if valid else "finished_unreliable"
         result = db.scalar(select(AuctionResult).where(AuctionResult.vehicle_id == vehicle.id))
         if not result:
