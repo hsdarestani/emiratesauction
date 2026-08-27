@@ -1,6 +1,9 @@
 let vehicles = [], opportunityVehicles = [], chart, opportunityMode = 'interesting';
 let liveVehicles = [], closedVehicles = [], opportunitiesIncludeAvoid = false;
 let liveLoading = false, closedLoading = false, opportunityLoading = false;
+let activeMainTab = 'opportunities';
+const PAGE_SIZE = 18;
+const visibleCounts = {opportunities: PAGE_SIZE, results: PAGE_SIZE, live: PAGE_SIZE};
 
 const $ = id => document.getElementById(id);
 const money = n => new Intl.NumberFormat('de-DE', {style:'currency', currency:'AED', maximumFractionDigits:0}).format(n || 0);
@@ -20,6 +23,45 @@ async function fetchJson(url, timeoutMs=12000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function switchMainTab(tab, shouldScroll=true) {
+  if (!['opportunities','results','live'].includes(tab)) return;
+  activeMainTab = tab;
+  document.querySelectorAll('.workspace-tab').forEach(button => button.classList.toggle('active', button.dataset.tab === tab));
+  document.querySelectorAll('.workspace-view').forEach(view => view.classList.toggle('active', view.id === tab));
+  if (history.replaceState) history.replaceState(null, '', `#${tab}`);
+  if (shouldScroll) document.querySelector('.workspace-tabs')?.scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+function refreshTab(tab=activeMainTab) {
+  if (tab === 'live') return loadLive();
+  if (tab === 'results') return loadClosed();
+  return loadOpportunities(opportunitiesIncludeAvoid);
+}
+
+function updateTabCounts() {
+  if ($('opportunitiesCount')) $('opportunitiesCount').textContent = opportunityVehicles.length;
+  if ($('resultsCount')) $('resultsCount').textContent = closedVehicles.length;
+  if ($('liveCount')) $('liveCount').textContent = liveVehicles.length;
+}
+
+function loadMoreMarkup(tab, shown, total) {
+  const target = tab === 'opportunities' ? 'opportunityMore' : tab === 'results' ? 'closedMore' : 'liveMore';
+  if (!$(target)) return;
+  if (shown >= total) {
+    $(target).innerHTML = '';
+    return;
+  }
+  const remaining = total - shown;
+  $(target).innerHTML = `<button class="load-more" onclick="showMore('${tab}')">Mehr anzeigen <strong>+${Math.min(PAGE_SIZE, remaining)}</strong></button>`;
+}
+
+function showMore(tab) {
+  visibleCounts[tab] += PAGE_SIZE;
+  if (tab === 'opportunities') renderOpportunities();
+  if (tab === 'results') renderClosed();
+  if (tab === 'live') renderLive();
 }
 
 function germanySummary(v) {
@@ -44,19 +86,38 @@ function purchaseMini(v) {
 const card = (v, closed=false, showPurchase=false) => `<article class="card ${closed?'closed':''}" onclick="openVehicle(${v.id})"><img src="${safe((v.images||[])[0]||'')}" alt="${safe(v.title)}"><div class="meta"><p>LOS #${safe(v.lot_id)} • ${closed?'BEENDET':'LIVE'}</p><h3>${safe(v.title)}</h3><div class="row"><span>${v.bid_count || 0} Gebote<br><small class="${closed?'final':'ending'}">${closed?'Zuletzt live erfasster Preis bei Auktionsende':`Endet in ${relative(v.auction_end_time)}`}</small></span><span class="right"><small>${closed?'ENDPREIS':'AKTUELLES GEBOT'}</small><b class="price">${money(closed?v.final_bid:v.current_bid)}</b></span></div><small>Letzte Aktualisierung: ${time(v.updated_at)}</small>${showPurchase?purchaseMini(v):''}${germanySummary(v)}${(v.condition_tags||[]).slice(0,4).map(t=>`<span class="tag">${safe(t)}</span>`).join('')}</div></article>`;
 
 function updateStats() {
-  const bids = closedVehicles.reduce((a,v)=>a+(v.bid_count||0),0);
   const max = closedVehicles.reduce((a,v)=>Math.max(a,v.final_bid||0),0);
   const buy = opportunityVehicles.filter(v=>v.purchase_recommendation==='KAUFEN').length;
   $('stats').innerHTML=[['BEENDETE AUKTIONEN',closedVehicles.length],['LIVE VERFOLGT',liveVehicles.length],['AKTUELLE KAUFCHANCEN',buy],['HÖCHSTER ERFASSTER ENDPREIS',money(max)]].map(x=>`<div class="stat"><p>${x[0]}</p><b>${x[1]}</b></div>`).join('');
+  updateTabCounts();
 }
 
-function renderOpportunities() {
+function filteredOpportunities() {
   let rows = opportunityVehicles;
   if (opportunityMode === 'interesting') rows = rows.filter(v => v.purchase_recommendation !== 'MEIDEN');
   if (opportunityMode === 'buy') rows = rows.filter(v => v.purchase_recommendation === 'KAUFEN');
   if (opportunityMode === 'review') rows = rows.filter(v => v.purchase_recommendation === 'PRÜFEN');
   if (opportunityMode === 'avoid') rows = rows.filter(v => v.purchase_recommendation === 'MEIDEN');
-  $('opportunityCards').innerHTML = rows.map(v => card(v, v.status === 'finished', true)).join('') || '<div class="loading">Für diesen Filter gibt es aktuell keine Fahrzeuge.</div>';
+  return rows;
+}
+
+function renderOpportunities() {
+  const rows = filteredOpportunities();
+  const shown = Math.min(visibleCounts.opportunities, rows.length);
+  $('opportunityCards').innerHTML = rows.slice(0, shown).map(v => card(v, v.status === 'finished', true)).join('') || '<div class="loading">Für diesen Filter gibt es aktuell keine Fahrzeuge.</div>';
+  loadMoreMarkup('opportunities', shown, rows.length);
+}
+
+function renderLive() {
+  const shown = Math.min(visibleCounts.live, liveVehicles.length);
+  $('liveCards').innerHTML = liveVehicles.slice(0, shown).map(v=>card(v)).join('') || '<div class="loading">Derzeit keine verfolgte Live-Auktion.</div>';
+  loadMoreMarkup('live', shown, liveVehicles.length);
+}
+
+function renderClosed() {
+  const shown = Math.min(visibleCounts.results, closedVehicles.length);
+  $('closedCards').innerHTML = closedVehicles.slice(0, shown).map(v=>card(v,true)).join('') || '<div class="loading">Noch keine verlässliche beendete Auktion erfasst.</div>';
+  loadMoreMarkup('results', shown, closedVehicles.length);
 }
 
 async function loadLive() {
@@ -65,7 +126,7 @@ async function loadLive() {
   try {
     liveVehicles = await fetchJson('/api/auctions/live', 10000);
     vehicles = [...closedVehicles, ...liveVehicles];
-    $('liveCards').innerHTML = liveVehicles.map(v=>card(v)).join('') || '<div class="loading">Derzeit keine verfolgte Live-Auktion.</div>';
+    renderLive();
     updateStats();
   } catch (error) {
     if (!$('liveCards').querySelector('.card')) $('liveCards').innerHTML='<div class="loading">Live-Daten konnten nicht geladen werden. Neuer Versuch läuft automatisch…</div>';
@@ -81,7 +142,7 @@ async function loadClosed() {
   try {
     closedVehicles = await fetchJson('/api/auctions/closed', 12000);
     vehicles = [...closedVehicles, ...liveVehicles];
-    $('closedCards').innerHTML = closedVehicles.map(v=>card(v,true)).join('') || '<div class="loading">Noch keine verlässliche beendete Auktion erfasst.</div>';
+    renderClosed();
     updateStats();
   } catch (error) {
     if (!$('closedCards').querySelector('.card')) $('closedCards').innerHTML='<div class="loading">Beendete Auktionen konnten nicht geladen werden. Neuer Versuch läuft automatisch…</div>';
@@ -111,6 +172,7 @@ async function loadOpportunities(includeAvoid=false) {
 
 async function setOpportunityFilter(mode) {
   opportunityMode = mode;
+  visibleCounts.opportunities = PAGE_SIZE;
   document.querySelectorAll('.filterbar button').forEach(button => button.classList.toggle('active', button.dataset.mode === mode));
   if ((mode === 'avoid' || mode === 'all') && !opportunitiesIncludeAvoid) {
     await loadOpportunities(true);
@@ -149,6 +211,13 @@ async function openVehicle(id) {
     console.error('vehicle detail', error);
   }
 }
+
+const initialTab = location.hash.replace('#','');
+switchMainTab(['opportunities','results','live'].includes(initialTab) ? initialTab : 'opportunities', false);
+window.addEventListener('hashchange', () => {
+  const tab = location.hash.replace('#','');
+  if (['opportunities','results','live'].includes(tab)) switchMainTab(tab, false);
+});
 
 loadLive();
 loadClosed();
