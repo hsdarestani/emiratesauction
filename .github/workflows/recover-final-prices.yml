@@ -1,4 +1,4 @@
-name: Probe legacy final prices
+name: Probe Emirates API final prices
 on:
   push:
     branches: [ops/recover-final-prices]
@@ -7,7 +7,7 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Test official Emirates detail for historical records
+      - name: Check expired lots in Emirates API
         uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.HOST }}
@@ -18,24 +18,38 @@ jobs:
             set -e
             cd /opt/emiratesauction
             docker compose exec -T backend python - <<'PY'
+            import httpx
             from sqlalchemy import select
+            from app.config import settings
             from app.database import SessionLocal
             from app.models import Vehicle
-            from app.scraper import fetch_detail, normalize
+            from app.scraper import HEADERS
 
             with SessionLocal() as db:
-                rows = db.scalars(
-                    select(Vehicle)
-                    .where(Vehicle.status == 'historical_unreliable')
-                    .order_by(Vehicle.auction_end_time.desc().nullslast(), Vehicle.updated_at.desc())
-                    .limit(8)
-                ).all()
-                print('sample_count=', len(rows))
-                for v in rows:
-                    try:
-                        detail = fetch_detail(v.lot_id)
-                        payload = normalize({}, detail)
-                        print('LOT', v.lot_id, '|', v.title, '| local=', v.current_bid, '| official_status=', payload.get('status'), '| official_price=', payload.get('current_bid'), '| end=', payload.get('auction_end_time'))
-                    except Exception as e:
-                        print('LOT', v.lot_id, '| ERROR', type(e).__name__, str(e)[:200])
+                rows=db.scalars(select(Vehicle).where(Vehicle.status=='historical_unreliable').limit(20)).all()
+                wanted={str(v.lot_id):v for v in rows}
+                print('wanted=', sorted(wanted))
+
+            with httpx.Client(timeout=30, headers=HEADERS, follow_redirects=True) as client:
+                r=client.post(f'{settings.ea_api_url}/api/Vehicles', json={})
+                print('api_status=', r.status_code)
+                r.raise_for_status()
+                data=r.json().get('Data', [])
+                print('api_items=', len(data))
+                expired=sum(1 for x in data if x.get('IsExpired'))
+                print('api_expired=', expired)
+                found=0
+                for x in data:
+                    lot=str(x.get('Lot') or x.get('Id'))
+                    if lot in wanted:
+                        found+=1
+                        print('FOUND', lot, '| IsExpired=',x.get('IsExpired'),'| CurrentPriceStr=',x.get('CurrentPriceStr'),'| EndDate=',x.get('EndDate'),'| Title=',x.get('Title'))
+                print('sample_historical_found=', found)
+                print('expired_examples=')
+                shown=0
+                for x in data:
+                    if x.get('IsExpired') and x.get('CurrentPriceStr'):
+                        print(str(x.get('Lot') or x.get('Id')), x.get('CurrentPriceStr'), x.get('Title'))
+                        shown+=1
+                        if shown>=10: break
             PY
