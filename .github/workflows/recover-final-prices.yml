@@ -1,13 +1,13 @@
-name: Recover production final prices
+name: Probe legacy final prices
 on:
   push:
     branches: [ops/recover-final-prices]
 
 jobs:
-  recover:
+  probe:
     runs-on: ubuntu-latest
     steps:
-      - name: Reset broker backlog and recover prices
+      - name: Test official Emirates detail for historical records
         uses: appleboy/ssh-action@v1.2.2
         with:
           host: ${{ secrets.HOST }}
@@ -17,43 +17,25 @@ jobs:
           script: |
             set -e
             cd /opt/emiratesauction
-            echo '=== BEFORE ==='
-            docker compose ps
             docker compose exec -T backend python - <<'PY'
-            from datetime import datetime, timedelta, timezone
-            from sqlalchemy import func, select
+            from sqlalchemy import select
             from app.database import SessionLocal
             from app.models import Vehicle
-            now=datetime.now(timezone.utc)
+            from app.scraper import fetch_detail, normalize
+
             with SessionLocal() as db:
-                total=db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status=='finished_unreliable')) or 0
-                recent=db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status=='finished_unreliable', Vehicle.finished_at>=now-timedelta(hours=48))) or 0
-                oldest=db.scalar(select(func.min(Vehicle.finished_at)).where(Vehicle.status=='finished_unreliable'))
-                newest=db.scalar(select(func.max(Vehicle.finished_at)).where(Vehicle.status=='finished_unreliable'))
-                print('unreliable_total=', total)
-                print('unreliable_last48h=', recent)
-                print('oldest=', oldest)
-                print('newest=', newest)
+                rows = db.scalars(
+                    select(Vehicle)
+                    .where(Vehicle.status == 'historical_unreliable')
+                    .order_by(Vehicle.auction_end_time.desc().nullslast(), Vehicle.updated_at.desc())
+                    .limit(8)
+                ).all()
+                print('sample_count=', len(rows))
+                for v in rows:
+                    try:
+                        detail = fetch_detail(v.lot_id)
+                        payload = normalize({}, detail)
+                        print('LOT', v.lot_id, '|', v.title, '| local=', v.current_bid, '| official_status=', payload.get('status'), '| official_price=', payload.get('current_bid'), '| end=', payload.get('auction_end_time'))
+                    except Exception as e:
+                        print('LOT', v.lot_id, '| ERROR', type(e).__name__, str(e)[:200])
             PY
-
-            echo '=== RESET REDIS BROKER STATE ==='
-            docker compose stop worker closing-worker beat
-            docker compose exec -T redis redis-cli FLUSHDB
-            docker compose up -d worker closing-worker beat
-            sleep 8
-            docker compose ps
-            docker compose exec -T redis redis-cli INFO memory | grep -E 'used_memory_human|maxmemory_human|maxmemory_policy'
-
-            echo '=== TRIGGER RECOVERY ==='
-            docker compose exec -T backend python - <<'PY'
-            from app.worker import dispatch_unreliable_recovery
-            print('queued=', dispatch_unreliable_recovery())
-            PY
-            sleep 25
-
-            echo '=== AFTER 25s ==='
-            curl -fsS http://127.0.0.1:8087/api/data-quality
-            echo
-            curl -fsS http://127.0.0.1:8087/api/auctions/closed | python3 -c 'import json,sys; r=json.load(sys.stdin); print("closed_count=",len(r)); print("with_final_bid=",sum(1 for x in r if x.get("final_bid"))) ; [print(x.get("lot_id"),x.get("title"),x.get("final_bid")) for x in r[:10]]'
-            echo '=== WORKER STATUS ==='
-            docker compose ps
