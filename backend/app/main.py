@@ -16,9 +16,9 @@ from .migrations import migrate
 
 app = FastAPI(title="Emirates Auction Intelligence", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
-# Finished auctions must remain visible even if the old collector could not
-# prove the exact final bid. Price confidence is a separate concern from the
-# fact that an auction ended.
+# Finished auctions may remain stored for audit/recovery even if their price
+# confidence is low. The public finished list, however, only exposes trusted
+# final prices.
 CLOSED_STATUSES = (
     "finished",
     "finished_unreliable",
@@ -63,12 +63,7 @@ def serialize(v):
 
 
 def serialize_card(v):
-    """Small payload for frequently refreshed dashboard cards.
-
-    Finished status and final-price confidence intentionally remain separate:
-    old/uncertain auctions stay visible, while only trusted final bids are
-    labelled as an Endpreis.
-    """
+    """Small payload for frequently refreshed dashboard cards."""
     observed_final = v.result.final_bid if v.result and v.price_data_valid else None
     last_observed = v.last_live_bid if v.last_live_bid is not None else v.current_bid
     return {
@@ -141,7 +136,10 @@ def live(db: Session = Depends(get_db)):
 def closed(db: Session = Depends(get_db)):
     rows = db.scalars(
         card_query()
-        .where(Vehicle.status.in_(CLOSED_STATUSES))
+        .where(
+            Vehicle.status == "finished",
+            Vehicle.price_data_valid.is_(True),
+        )
         .order_by(desc(func.coalesce(Vehicle.finished_at, Vehicle.auction_end_time, Vehicle.updated_at)))
     ).all()
     return [serialize_card(x) for x in rows]
