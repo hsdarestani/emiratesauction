@@ -16,6 +16,18 @@ from .migrations import migrate
 
 app = FastAPI(title="Emirates Auction Intelligence", docs_url="/api/docs", openapi_url="/api/openapi.json")
 
+# Finished auctions must remain visible even if the old collector could not
+# prove the exact final bid. Price confidence is a separate concern from the
+# fact that an auction ended.
+CLOSED_STATUSES = (
+    "finished",
+    "finished_unreliable",
+    "historical_unreliable",
+    "verified",
+    "verification_failed",
+    "finalizing",
+)
+
 
 class TrackIn(BaseModel):
     lot_url: HttpUrl
@@ -42,10 +54,10 @@ def serialize(v):
     data["last_live_bid"] = float(v.last_live_bid or 0) if v.last_live_bid is not None else None
     data["verified_final_price"] = float(v.result.verified_final_price) if v.result and v.result.verified_final_price is not None else None
     data["final_bid"] = float(observed_final) if observed_final is not None else None
-    data["final_price_status"] = v.result.final_price_status if v.result else ("live" if v.status in ("active", "ending") else "finalizing")
+    data["final_price_status"] = v.result.final_price_status if v.result else ("live" if v.status in ("active", "ending") else "unavailable")
     data["final_price_verified_at"] = v.result.final_price_verified_at if v.result else None
     data["final_price_source"] = v.result.final_price_source if v.result else None
-    data["sold_date"] = v.finished_at if v.price_data_valid else None
+    data["sold_date"] = (v.finished_at or v.auction_end_time) if v.status in CLOSED_STATUSES else None
     data["germany"] = serialize_comparison(v)
     return data
 
@@ -53,20 +65,25 @@ def serialize(v):
 def serialize_card(v):
     """Small payload for frequently refreshed dashboard cards.
 
-    Full purchase analysis, inspection fields and galleries are intentionally
-    loaded only when the vehicle detail/opportunity endpoints are requested.
-    This keeps the 2-second live feed cheap even with hundreds of tracked lots.
+    Finished status and final-price confidence intentionally remain separate:
+    old/uncertain auctions stay visible, while only trusted final bids are
+    labelled as an Endpreis.
     """
     observed_final = v.result.final_bid if v.result and v.price_data_valid else None
+    last_observed = v.last_live_bid if v.last_live_bid is not None else v.current_bid
     return {
         "id": v.id,
         "lot_id": v.lot_id,
         "title": v.title,
         "status": v.status,
         "current_bid": float(v.current_bid or 0),
+        "last_live_bid": float(last_observed) if last_observed is not None else None,
         "final_bid": float(observed_final) if observed_final is not None else None,
+        "final_price_status": v.result.final_price_status if v.result else "unavailable",
+        "price_source": v.price_source,
         "bid_count": v.bid_count or 0,
         "auction_end_time": v.auction_end_time,
+        "finished_at": v.finished_at or v.auction_end_time,
         "updated_at": v.updated_at,
         "condition_tags": v.condition_tags or [],
         "images": [v.images[0].url] if v.images else [],
@@ -98,7 +115,7 @@ def health(): return {"status": "ok", "source": "Emirates Auction live API"}
 
 @app.get("/api/vehicles")
 def vehicles(db: Session = Depends(get_db)):
-    rows = db.scalars(vehicle_query().where(or_(Vehicle.status.in_(("active", "ending")), Vehicle.price_data_valid.is_(True))).order_by(Vehicle.auction_end_time)).all()
+    rows = db.scalars(vehicle_query().where(or_(Vehicle.status.in_(("active", "ending")), Vehicle.status.in_(CLOSED_STATUSES))).order_by(Vehicle.auction_end_time)).all()
     return [serialize(x) for x in rows]
 
 
@@ -122,7 +139,11 @@ def live(db: Session = Depends(get_db)):
 
 @app.get("/api/auctions/closed")
 def closed(db: Session = Depends(get_db)):
-    rows = db.scalars(card_query().where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True)).order_by(desc(Vehicle.auction_end_time), desc(Vehicle.updated_at))).all()
+    rows = db.scalars(
+        card_query()
+        .where(Vehicle.status.in_(CLOSED_STATUSES))
+        .order_by(desc(func.coalesce(Vehicle.finished_at, Vehicle.auction_end_time, Vehicle.updated_at)))
+    ).all()
     return [serialize_card(x) for x in rows]
 
 
