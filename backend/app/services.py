@@ -157,7 +157,14 @@ def verify_final_price(db, vehicle, detail=None):
     price = Decimal(payload["current_bid"])
     verified_at = datetime.now(timezone.utc)
     vehicle.current_bid = price
-    vehicle.status = "verified"
+    vehicle.last_live_bid = price
+    vehicle.last_live_bid_at = verified_at
+    # A verified post-auction detail is a publishable finished result. Keeping
+    # the old "verified" vehicle status made these rows invisible because the
+    # public finished endpoint intentionally serves status="finished" only.
+    vehicle.status = "finished"
+    vehicle.price_data_valid = True
+    vehicle.price_source = "emirates_expired_detail"
     vehicle.finished_at = vehicle.finished_at or verified_at
     result.final_bid = price
     result.verified_final_price = price
@@ -181,7 +188,11 @@ def collect(db, limit=10):
         try: detail = fetch_detail(vehicle.lot_id)
         except Exception: continue
         upsert_vehicle(db, normalize(listing, detail), tracked=True)
-    tracked = db.scalars(select(Vehicle).where(Vehicle.is_tracked.is_(True), Vehicle.status == "active")).all()
+    # Recovery path: an auction can already be marked "ending" when the shared
+    # closing feed misses a cycle. Include ending rows here so a later official
+    # detail fetch can still move them to finished instead of leaving them stuck
+    # forever outside the finished list.
+    tracked = db.scalars(select(Vehicle).where(Vehicle.is_tracked.is_(True), Vehicle.status.in_(("active", "ending")))).all()
     known = {str(x.get("Lot") or x.get("Id")): x for x in listings}
     for vehicle in tracked:
         listing = known.get(vehicle.lot_id)
