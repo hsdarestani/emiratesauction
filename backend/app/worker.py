@@ -46,7 +46,11 @@ QUEUE_MARKER_TTL_SECONDS = 45
 # evidence artificially stale before finalization.
 CLOSING_MISS_CONFIRMATIONS = 1
 CLOSING_OBSERVATION_MAX_GAP_SECONDS = 12
-MIN_HEALTHY_ACTIVE_FEED_SIZE = 100
+# The active inventory can legitimately fall well below 100 between auction
+# batches. HTTP/JSON failures already raise in fetch_live(); only reject an
+# implausibly tiny successful payload here so a low inventory does not freeze
+# every vehicle in the "ending" state.
+MIN_HEALTHY_ACTIVE_FEED_SIZE = 5
 
 
 def closing_queue_for(vehicle, now):
@@ -109,7 +113,10 @@ def poll_closing_feed():
     and it is absent from a healthy snapshot, the immediately preceding API bid
     becomes our observed end price, provided that observation is still recent.
     """
-    lock = redis.lock("auction:closing-feed", timeout=12, blocking_timeout=0)
+    # fetch_live() has a 30 second request timeout. Keep the Redis lock alive
+    # longer than that so a slow upstream response cannot create overlapping
+    # closing snapshots that race each other.
+    lock = redis.lock("auction:closing-feed", timeout=40, blocking_timeout=0)
     if not lock.acquire(blocking=False):
         return "duplicate"
 
