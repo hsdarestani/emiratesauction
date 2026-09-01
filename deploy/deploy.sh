@@ -78,7 +78,7 @@ for attempt in $(seq 1 12); do
 
     echo "Production health check passed"
     docker compose exec -T backend python - <<'PY' || true
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from app.database import SessionLocal
 from app.models import Vehicle
 with SessionLocal() as db:
@@ -87,6 +87,41 @@ with SessionLocal() as db:
     finished = db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True))) or 0
     unreliable = db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status == "finished_unreliable")) or 0
     print({"vehicles": total, "active": active, "finished_valid": finished, "finished_unreliable": unreliable})
+
+    sources = db.execute(
+        select(Vehicle.price_source, func.count())
+        .where(Vehicle.status == "finished_unreliable")
+        .group_by(Vehicle.price_source)
+        .order_by(desc(func.count()))
+    ).all()
+    print("unreliable_by_source", [(source, count) for source, count in sources])
+
+    gap_stats = db.execute(
+        select(
+            func.min(Vehicle.monitoring_gap_seconds),
+            func.avg(Vehicle.monitoring_gap_seconds),
+            func.max(Vehicle.monitoring_gap_seconds),
+        ).where(Vehicle.status == "finished_unreliable")
+    ).one()
+    print("unreliable_gap_seconds", {"min": gap_stats[0], "avg": float(gap_stats[1]) if gap_stats[1] is not None else None, "max": gap_stats[2]})
+
+    latest = db.scalars(
+        select(Vehicle)
+        .where(Vehicle.status == "finished_unreliable")
+        .order_by(desc(Vehicle.finished_at))
+        .limit(12)
+    ).all()
+    for v in latest:
+        print("unreliable_sample", {
+            "lot": v.lot_id,
+            "title": v.title,
+            "end": v.auction_end_time.isoformat() if v.auction_end_time else None,
+            "finished": v.finished_at.isoformat() if v.finished_at else None,
+            "last_seen": v.last_live_bid_at.isoformat() if v.last_live_bid_at else None,
+            "gap": v.monitoring_gap_seconds,
+            "source": v.price_source,
+            "last_bid": float(v.last_live_bid) if v.last_live_bid is not None else None,
+        })
 PY
     free -h
     docker compose ps
