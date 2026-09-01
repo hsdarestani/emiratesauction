@@ -59,20 +59,26 @@ nginx -t && systemctl reload nginx
 # deploy. Beat schedules those jobs after the server has settled.
 for attempt in $(seq 1 12); do
   if curl -fsS -m 5 http://127.0.0.1:8087/ >/dev/null && curl -fsS -m 5 http://127.0.0.1:8087/api/health >/dev/null; then
-    # HTTP can be healthy while the Celery workers are crash-looping. That used
-    # to let deployments pass even though no auctions could advance to finished.
-    sleep 5
+    # HTTP can be healthy while a Celery worker starts, crashes and is instantly
+    # restarted by Docker. Require a stable observation window and zero restarts.
+    sleep 15
     workers_ok=1
     for service in worker closing-worker beat; do
       cid="$(docker compose ps -q "$service")"
-      if [ -z "$cid" ] || [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)" != "true" ]; then
-        echo "Required service is not running: $service" >&2
+      running=""
+      restarts=""
+      if [ -n "$cid" ]; then
+        running="$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)"
+        restarts="$(docker inspect -f '{{.RestartCount}}' "$cid" 2>/dev/null || true)"
+      fi
+      if [ -z "$cid" ] || [ "$running" != "true" ] || [ "${restarts:-0}" != "0" ]; then
+        echo "Required service is unstable: $service running=${running:-missing} restarts=${restarts:-unknown}" >&2
         workers_ok=0
       fi
     done
     if [ "$workers_ok" -ne 1 ]; then
       docker compose ps >&2 || true
-      docker compose logs --tail=160 worker closing-worker beat >&2 || true
+      docker compose logs --tail=220 worker closing-worker beat >&2 || true
       exit 1
     fi
 
@@ -132,5 +138,5 @@ done
 
 echo "Production health check failed" >&2
 docker compose ps >&2 || true
-docker compose logs --tail=160 backend frontend worker closing-worker beat >&2 || true
+docker compose logs --tail=220 backend frontend worker closing-worker beat >&2 || true
 exit 1
