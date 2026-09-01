@@ -70,7 +70,8 @@ def check_closing_pipeline():
             raise RuntimeError("Valid closing price did not reach the public closed serializer")
 
     with _session() as db:
-        stale = _vehicle("__acceptance-stale__", now, 20, 99999)
+        # Keep this safely outside the production near-real-time tolerance.
+        stale = _vehicle("__acceptance-stale__", now, 25, 99999)
         db.add(stale)
         db.commit()
         state = _finalize_from_closing_feed(db, stale, now)
