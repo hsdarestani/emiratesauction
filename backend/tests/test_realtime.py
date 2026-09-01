@@ -1,16 +1,16 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
 from app.main import closed
-from app.models import Vehicle
+from app.models import AuctionSnapshot, Vehicle
 from app.scraper import parse_dt
 from app.services import monitoring_is_valid, poll_interval, resolve_closing_price
-from app.worker import _finalize_from_closing_feed, closing_observation_is_valid, closing_queue_for
+from app.worker import _apply_closing_listing, _finalize_from_closing_feed, closing_observation_is_valid, closing_queue_for
 
 
 def test_adaptive_poll_intervals():
@@ -73,10 +73,10 @@ def test_last_five_minutes_use_dedicated_closing_queue():
     assert closing_queue_for(SimpleNamespace(auction_end_time=None), now) == "live"
 
 
-def test_closing_feed_tolerates_measured_api_latency_but_stays_tight():
+def test_closing_feed_tolerates_one_slow_full_snapshot_but_stays_tight():
     observed = datetime.now(timezone.utc)
-    assert closing_observation_is_valid(observed - timedelta(seconds=12), observed)
-    assert not closing_observation_is_valid(observed - timedelta(seconds=13), observed)
+    assert closing_observation_is_valid(observed - timedelta(seconds=20), observed)
+    assert not closing_observation_is_valid(observed - timedelta(seconds=21), observed)
     assert not closing_observation_is_valid(None, observed)
 
 
@@ -105,6 +105,47 @@ def _ending_vehicle(lot_id, now, last_seen_seconds_ago, bid=12345):
     )
 
 
+def test_closing_snapshot_updates_bid_without_general_upsert_path():
+    observed = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    with _isolated_session() as db:
+        vehicle = Vehicle(
+            lot_id="snapshot-fast-path",
+            url="https://www.emiratesauction.com/auctions/vehicles/snapshot-fast-path/4",
+            title="2024 BMW X5",
+            current_bid=50000,
+            last_live_bid=50000,
+            last_live_bid_at=observed - timedelta(seconds=8),
+            bid_count=4,
+            auction_end_time=observed + timedelta(minutes=2),
+            status="ending",
+            is_tracked=True,
+        )
+        db.add(vehicle)
+        db.commit()
+
+        listing = {
+            "Lot": "snapshot-fast-path",
+            "Title": "2024 BMW X5",
+            "Year": 2024,
+            "CurrentPriceStr": "AED 54,321",
+            "Bids": 5,
+            "EndDate": "2026-09-01T16:02:00",
+            "IsExpired": False,
+        }
+        _apply_closing_listing(db, vehicle, listing, observed)
+        db.commit()
+
+        assert vehicle.current_bid == 54321
+        assert vehicle.last_live_bid == 54321
+        assert vehicle.last_live_bid_at == observed
+        assert vehicle.bid_count == 5
+        assert vehicle.status == "ending"
+        snapshot = db.scalar(select(AuctionSnapshot).where(AuctionSnapshot.vehicle_id == vehicle.id))
+        assert snapshot is not None
+        assert snapshot.current_bid == 54321
+        assert snapshot.bid_count == 5
+
+
 def test_closing_feed_result_reaches_public_closed_endpoint():
     """Acceptance test for the exact path that used to leave Beendet empty."""
     now = datetime.now(timezone.utc)
@@ -126,7 +167,7 @@ def test_closing_feed_result_reaches_public_closed_endpoint():
 def test_stale_closing_observation_is_hidden_from_public_closed_endpoint():
     now = datetime.now(timezone.utc)
     with _isolated_session() as db:
-        vehicle = _ending_vehicle("smoke-stale", now, last_seen_seconds_ago=20, bid=99999)
+        vehicle = _ending_vehicle("smoke-stale", now, last_seen_seconds_ago=21, bid=99999)
         db.add(vehicle)
         db.commit()
 
