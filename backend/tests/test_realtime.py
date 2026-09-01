@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from app.scraper import parse_dt
 from app.services import monitoring_is_valid, poll_interval, resolve_closing_price
 from app.worker import closing_observation_is_valid, closing_queue_for
 
@@ -16,6 +17,16 @@ def test_adaptive_poll_intervals():
 def test_past_end_is_polled_immediately():
     now = datetime.now(timezone.utc)
     assert poll_interval(now - timedelta(seconds=1), now) == 2
+
+
+def test_emirates_naive_enddate_is_dubai_local_time():
+    parsed = parse_dt("2026-08-27T21:50:40")
+    assert parsed == datetime(2026, 8, 27, 17, 50, 40, tzinfo=timezone.utc)
+
+
+def test_emirates_explicit_timezone_is_preserved_and_normalized_to_utc():
+    assert parse_dt("2026-08-27T21:50:40+04:00") == datetime(2026, 8, 27, 17, 50, 40, tzinfo=timezone.utc)
+    assert parse_dt("2026-08-27T17:50:40Z") == datetime(2026, 8, 27, 17, 50, 40, tzinfo=timezone.utc)
 
 
 def test_end_price_requires_tight_monitoring_gap_when_expired_detail_hides_price():
