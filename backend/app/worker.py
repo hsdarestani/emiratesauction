@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -8,9 +9,9 @@ from sqlalchemy import or_, select
 from .autoscout import compare_closed, compare_live
 from .config import settings
 from .database import Base, SessionLocal, engine
-from .models import AuctionResult, Vehicle
+from .models import AuctionResult, AuctionSnapshot, Vehicle
 from .scraper import fetch_live, normalize
-from .services import collect, poll_interval, update_one, upsert_vehicle, verify_final_price
+from .services import collect, poll_interval, update_one, verify_final_price
 
 # Tasks are fire-and-forget. Keeping every Celery result in the same Redis
 # instance as the broker caused Redis to grow until the small VPS hit OOM.
@@ -40,17 +41,14 @@ redis = Redis.from_url(settings.redis_url)
 
 CLOSING_WINDOW_SECONDS = 5 * 60
 QUEUE_MARKER_TTL_SECONDS = 45
-# The official Vehicles feed currently takes roughly five seconds per full
-# snapshot in production. One healthy post-EndDate absence is therefore enough
-# when we observed the lot immediately beforehand; requiring two misses made the
-# evidence artificially stale before finalization.
 CLOSING_MISS_CONFIRMATIONS = 1
-CLOSING_OBSERVATION_MAX_GAP_SECONDS = 12
-# The active inventory can legitimately fall well below 100 between auction
-# batches. HTTP/JSON failures already raise in fetch_live(); only reject an
-# implausibly tiny successful payload here so a low inventory does not freeze
-# every vehicle in the "ending" state.
+# The full official feed usually needs several seconds. A 20-second window is
+# still near-real-time, but unlike the old 12-second threshold it tolerates one
+# slow upstream snapshot without throwing away an otherwise continuous trace.
+CLOSING_OBSERVATION_MAX_GAP_SECONDS = 20
 MIN_HEALTHY_ACTIVE_FEED_SIZE = 5
+CLOSING_BATCH_LIMIT = 2000
+CLOSING_HEALTH_KEY = "auction:closing-health"
 
 
 def closing_queue_for(vehicle, now):
@@ -67,7 +65,51 @@ def closing_observation_is_valid(last_seen_at, observed_at):
     return 0 <= gap <= CLOSING_OBSERVATION_MAX_GAP_SECONDS
 
 
-def _finalize_from_closing_feed(db, vehicle, observed_at):
+def _write_closing_health(**values):
+    mapping = {k: str(v) for k, v in values.items() if v is not None}
+    if mapping:
+        redis.hset(CLOSING_HEALTH_KEY, mapping=mapping)
+        redis.expire(CLOSING_HEALTH_KEY, 600)
+
+
+def _apply_closing_listing(db, vehicle, listing, observed_at):
+    """Apply one item from a shared feed snapshot without per-row commits/images.
+
+    The previous implementation called the general upsert path for every lot in
+    the closing window. With hundreds of cars ending together that meant hundreds
+    of SELECT/COMMIT/image operations per snapshot, stretching a nominal 2-second
+    monitor beyond the final-price validity window. This path only writes the
+    fields needed to capture the closing bid and commits the whole snapshot once.
+    """
+    payload = normalize(listing)
+    price = Decimal(payload["current_bid"] or 0)
+    bids = int(payload["bid_count"] or 0)
+    previous_price = Decimal(vehicle.current_bid or 0)
+    previous_bids = int(vehicle.bid_count or 0)
+
+    if price > 0 and (previous_price != price or previous_bids != bids):
+        db.add(
+            AuctionSnapshot(
+                vehicle_id=vehicle.id,
+                current_bid=price,
+                bid_count=bids,
+                price_jump=price - previous_price if previous_price > 0 else Decimal(0),
+            )
+        )
+
+    vehicle.current_bid = price
+    vehicle.last_live_bid = price
+    # One timestamp describes the actual official snapshot receipt for every row.
+    vehicle.last_live_bid_at = observed_at
+    vehicle.bid_count = bids
+    vehicle.auction_end_time = payload["auction_end_time"] or vehicle.auction_end_time
+    vehicle.status = "ending"
+    vehicle.is_tracked = True
+    vehicle.next_poll_at = observed_at + timedelta(seconds=2)
+    return vehicle
+
+
+def _finalize_from_closing_feed(db, vehicle, observed_at, commit=True):
     """Trust the last API bid only when the lot was observed immediately before disappearance."""
     last_seen_at = vehicle.last_live_bid_at
     price = Decimal(vehicle.last_live_bid or vehicle.current_bid or 0)
@@ -93,7 +135,8 @@ def _finalize_from_closing_feed(db, vehicle, observed_at):
         db.add(result)
     result.final_bid = price if valid else None
     result.final_price_status = "observed" if valid else "unreliable"
-    db.commit()
+    if commit:
+        db.commit()
     return "finished_valid" if valid else "finished_unreliable"
 
 
@@ -106,22 +149,14 @@ def poll_live_auctions():
 
 @celery.task(name="poll_closing_feed")
 def poll_closing_feed():
-    """Monitor every auction in its final five minutes from one official API snapshot.
-
-    The Vehicles API only exposes active lots. While a lot is present we store
-    its latest bid and any extended EndDate. Once its known end time has passed
-    and it is absent from a healthy snapshot, the immediately preceding API bid
-    becomes our observed end price, provided that observation is still recent.
-    """
-    # fetch_live() has a 30 second request timeout. Keep the Redis lock alive
-    # longer than that so a slow upstream response cannot create overlapping
-    # closing snapshots that race each other.
+    """Monitor all tracked auctions in their final five minutes from one API snapshot."""
+    started = time.monotonic()
     lock = redis.lock("auction:closing-feed", timeout=40, blocking_timeout=0)
     if not lock.acquire(blocking=False):
         return "duplicate"
 
     try:
-        now = datetime.now(timezone.utc)
+        scan_started_at = datetime.now(timezone.utc)
         with SessionLocal() as db:
             closing = db.scalars(
                 select(Vehicle)
@@ -129,18 +164,37 @@ def poll_closing_feed():
                     Vehicle.is_tracked.is_(True),
                     Vehicle.status.in_(("active", "ending")),
                     Vehicle.auction_end_time.is_not(None),
-                    Vehicle.auction_end_time <= now + timedelta(seconds=CLOSING_WINDOW_SECONDS),
+                    Vehicle.auction_end_time <= scan_started_at + timedelta(seconds=CLOSING_WINDOW_SECONDS),
                 )
                 .order_by(Vehicle.auction_end_time)
-                .limit(250)
+                .limit(CLOSING_BATCH_LIMIT)
             ).all()
 
             if not closing:
+                _write_closing_health(
+                    last_ok_at=datetime.now(timezone.utc).isoformat(),
+                    tracked=0,
+                    updated=0,
+                    finished=0,
+                    feed_size=0,
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    status="idle",
+                )
                 return {"tracked": 0, "updated": 0, "finished": 0}
 
             inventory = fetch_live()
-            # Never interpret an API outage/truncated payload as hundreds of auctions ending.
+            # Timestamp AFTER the HTTP request: this is when the official snapshot
+            # was actually observed, not when the request happened to start.
+            observed_at = datetime.now(timezone.utc)
+
             if len(inventory) < MIN_HEALTHY_ACTIVE_FEED_SIZE:
+                _write_closing_health(
+                    last_error_at=observed_at.isoformat(),
+                    tracked=len(closing),
+                    feed_size=len(inventory),
+                    duration_ms=round((time.monotonic() - started) * 1000),
+                    status="feed_too_small",
+                )
                 return {
                     "tracked": len(closing),
                     "updated": 0,
@@ -149,12 +203,10 @@ def poll_closing_feed():
                     "status": "feed_too_small",
                 }
 
-            active = {
-                str(item.get("Lot") or item.get("Id")): item
-                for item in inventory
-            }
+            active = {str(item.get("Lot") or item.get("Id")): item for item in inventory}
             updated = 0
             finished = 0
+            valid_finished_ids = []
 
             for vehicle in closing:
                 listing = active.get(vehicle.lot_id)
@@ -162,37 +214,61 @@ def poll_closing_feed():
 
                 if listing is not None:
                     redis.delete(miss_key)
-                    payload = normalize(listing)
-                    payload["status"] = "ending"
-                    current = upsert_vehicle(db, payload, tracked=True)
-                    current.next_poll_at = now + timedelta(seconds=2)
-                    db.commit()
+                    _apply_closing_listing(db, vehicle, listing, observed_at)
                     updated += 1
                     continue
 
-                # Absence before the currently known EndDate is not an ending signal.
-                # This also protects against transient feed omissions.
-                if vehicle.auction_end_time and now < vehicle.auction_end_time:
+                # Use snapshot receipt time, not request-start time. If a lot has
+                # disappeared and its known EndDate has passed, this is an ending signal.
+                if vehicle.auction_end_time and observed_at < vehicle.auction_end_time:
                     redis.delete(miss_key)
                     continue
 
                 misses = redis.incr(miss_key)
-                redis.expire(miss_key, 20)
+                redis.expire(miss_key, 30)
                 if misses < CLOSING_MISS_CONFIRMATIONS:
                     continue
 
-                state = _finalize_from_closing_feed(db, vehicle, now)
+                state = _finalize_from_closing_feed(db, vehicle, observed_at, commit=False)
                 redis.delete(miss_key)
                 if state == "finished_valid":
-                    compare_finished_vehicle.delay(vehicle.id)
+                    valid_finished_ids.append(vehicle.id)
                 finished += 1
 
+            # Critical scalability fix: one DB transaction per official snapshot,
+            # not one (or two) commits for every closing vehicle.
+            db.commit()
+
+            for vehicle_id in valid_finished_ids:
+                compare_finished_vehicle.delay(vehicle_id)
+
+            duration_ms = round((time.monotonic() - started) * 1000)
+            _write_closing_health(
+                last_ok_at=observed_at.isoformat(),
+                tracked=len(closing),
+                updated=updated,
+                finished=finished,
+                valid_finished=len(valid_finished_ids),
+                feed_size=len(inventory),
+                duration_ms=duration_ms,
+                status="ok",
+            )
             return {
                 "tracked": len(closing),
                 "updated": updated,
                 "finished": finished,
+                "valid_finished": len(valid_finished_ids),
                 "feed_size": len(inventory),
+                "duration_ms": duration_ms,
             }
+    except Exception as exc:
+        _write_closing_health(
+            last_error_at=datetime.now(timezone.utc).isoformat(),
+            last_error=repr(exc)[:300],
+            duration_ms=round((time.monotonic() - started) * 1000),
+            status="error",
+        )
+        raise
     finally:
         try:
             lock.release()
@@ -275,9 +351,6 @@ def poll_vehicle(vehicle_id):
 def dispatch_unreliable_recovery():
     """Retry recent hidden finishes against the official expired detail page."""
     now = datetime.now(timezone.utc)
-    # Keep a wide enough recovery window to repair the rows affected by the
-    # historical Dubai-vs-UTC EndDate bug, without turning this into an
-    # unbounded archive crawler.
     cutoff = now - timedelta(days=14)
     queued = 0
     with SessionLocal() as db:
