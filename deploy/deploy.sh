@@ -59,7 +59,35 @@ nginx -t && systemctl reload nginx
 # deploy. Beat schedules those jobs after the server has settled.
 for attempt in $(seq 1 12); do
   if curl -fsS -m 5 http://127.0.0.1:8087/ >/dev/null && curl -fsS -m 5 http://127.0.0.1:8087/api/health >/dev/null; then
+    # HTTP can be healthy while the Celery workers are crash-looping. That used
+    # to let deployments pass even though no auctions could advance to finished.
+    sleep 5
+    workers_ok=1
+    for service in worker closing-worker beat; do
+      cid="$(docker compose ps -q "$service")"
+      if [ -z "$cid" ] || [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)" != "true" ]; then
+        echo "Required service is not running: $service" >&2
+        workers_ok=0
+      fi
+    done
+    if [ "$workers_ok" -ne 1 ]; then
+      docker compose ps >&2 || true
+      docker compose logs --tail=160 worker closing-worker beat >&2 || true
+      exit 1
+    fi
+
     echo "Production health check passed"
+    docker compose exec -T backend python - <<'PY' || true
+from sqlalchemy import func, select
+from app.database import SessionLocal
+from app.models import Vehicle
+with SessionLocal() as db:
+    total = db.scalar(select(func.count()).select_from(Vehicle)) or 0
+    active = db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status.in_(("active", "ending")))) or 0
+    finished = db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status == "finished", Vehicle.price_data_valid.is_(True))) or 0
+    unreliable = db.scalar(select(func.count()).select_from(Vehicle).where(Vehicle.status == "finished_unreliable")) or 0
+    print({"vehicles": total, "active": active, "finished_valid": finished, "finished_unreliable": unreliable})
+PY
     free -h
     docker compose ps
     exit 0
@@ -69,5 +97,5 @@ done
 
 echo "Production health check failed" >&2
 docker compose ps >&2 || true
-docker compose logs --tail=80 backend frontend >&2 || true
+docker compose logs --tail=160 backend frontend worker closing-worker beat >&2 || true
 exit 1
