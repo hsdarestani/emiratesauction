@@ -54,6 +54,12 @@ docker compose exec -T redis redis-cli info memory | grep -E '^(used_memory_huma
 docker compose up -d --build --remove-orphans
 docker compose exec -T backend python -c 'from app.migrations import migrate; migrate()'
 
+# Do not trust a green HTTP health check alone. Run the exact closing transition
+# and the public Beendet serializer against an isolated in-memory database inside
+# the production image, plus one real read from the official Emirates feed. A
+# deployment fails here if a fresh end price would not reach /api/auctions/closed.
+docker compose exec -T backend python -m app.closing_acceptance
+
 if [ ! -f /etc/letsencrypt/live/emiratesauction.smarbiz.sbs/fullchain.pem ]; then
   cat >/etc/nginx/sites-available/emiratesauction.smarbiz.sbs <<'NGINX'
 server {
