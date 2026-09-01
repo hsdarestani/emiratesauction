@@ -1,6 +1,6 @@
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -25,6 +25,12 @@ VALUABLE_MODELS = (
     "GMC Yukon", "GMC Sierra", "Volkswagen Golf R", "Volkswagen Touareg", "Volvo XC90",
 )
 
+# Emirates Auction sends EndDate without a timezone offset in the Vehicles feed.
+# Those values are Dubai local time (UTC+4, no DST). Treating them as UTC made
+# every auction appear to end exactly four hours late, so the closing worker
+# only noticed disappearance long after the real final bid was gone.
+DUBAI_TZ = timezone(timedelta(hours=4))
+
 
 def is_quality_vehicle(item):
     title = (item.get("Title") or item.get("EventTitle") or "").strip().lower()
@@ -40,7 +46,12 @@ def money(value):
 
 
 def parse_dt(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00")) if value else None
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=DUBAI_TZ)
+    return parsed.astimezone(timezone.utc)
 
 
 def fetch_live(limit=None):
