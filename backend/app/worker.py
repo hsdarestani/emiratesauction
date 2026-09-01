@@ -273,9 +273,12 @@ def poll_vehicle(vehicle_id):
 
 @celery.task(name="dispatch_unreliable_recovery")
 def dispatch_unreliable_recovery():
-    """Retry only recent finishes that were hidden because the old queue was late."""
+    """Retry recent hidden finishes against the official expired detail page."""
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=48)
+    # Keep a wide enough recovery window to repair the rows affected by the
+    # historical Dubai-vs-UTC EndDate bug, without turning this into an
+    # unbounded archive crawler.
+    cutoff = now - timedelta(days=14)
     queued = 0
     with SessionLocal() as db:
         rows = db.scalars(select(Vehicle).where(
@@ -288,7 +291,9 @@ def dispatch_unreliable_recovery():
             if not redis.set(marker, "1", nx=True, ex=120):
                 continue
             try:
-                recover_unreliable_vehicle.apply_async((vehicle.id,), queue="closing")
+                # Recovery performs HTML detail requests and must never compete
+                # with the two-second closing feed for its dedicated queue.
+                recover_unreliable_vehicle.apply_async((vehicle.id,), queue="finalize")
                 queued += 1
             except Exception:
                 redis.delete(marker)
