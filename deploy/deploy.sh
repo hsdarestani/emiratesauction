@@ -9,8 +9,7 @@ if ! command -v docker >/dev/null 2>&1; then
   systemctl enable --now docker
 fi
 
-# This VPS has ~2 GB RAM. A small swap file prevents the kernel from killing
-# Redis/Celery during image builds or short traffic spikes.
+# Keep a small swap file for short image-build / worker spikes.
 if ! swapon --show --noheadings | grep -q .; then
   if [ ! -f /swapfile ]; then
     fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
@@ -32,9 +31,25 @@ if [ ! -f .env ]; then
   sed -i "s/change-me/$(openssl rand -hex 24)/g" .env
 fi
 
-# Free memory before BuildKit starts. Scheduled work is idempotent and resumes
-# automatically after compose comes back up.
+# Stop every Celery producer/consumer before touching the broker. Redis is a
+# dedicated, non-persistent Celery broker + short-lived lock store in this
+# compose stack (no Redis volume, appendonly off). Old broker messages are fully
+# reconstructible by Beat, while keeping them can leave Redis at maxmemory and
+# make every worker crash-loop before it can process a single auction.
 docker compose stop worker closing-worker beat >/dev/null 2>&1 || true
+docker compose rm -sf redis >/dev/null 2>&1 || true
+
+# Recreating the dedicated Redis container gives Celery a clean broker without
+# touching PostgreSQL, where all auction/history data is stored.
+docker compose up -d redis
+for attempt in $(seq 1 20); do
+  if docker compose exec -T redis redis-cli ping 2>/dev/null | grep -q PONG; then
+    break
+  fi
+  sleep 1
+done
+docker compose exec -T redis redis-cli ping | grep -q PONG
+docker compose exec -T redis redis-cli info memory | grep -E '^(used_memory_human|maxmemory_human|maxmemory_policy):' || true
 
 docker compose up -d --build --remove-orphans
 docker compose exec -T backend python -c 'from app.migrations import migrate; migrate()'
@@ -83,6 +98,7 @@ for attempt in $(seq 1 12); do
     fi
 
     echo "Production health check passed"
+    docker compose exec -T redis redis-cli info memory | grep -E '^(used_memory_human|maxmemory_human|maxmemory_policy):' || true
     docker compose exec -T backend python - <<'PY' || true
 from sqlalchemy import desc, func, select
 from app.database import SessionLocal
